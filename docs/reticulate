@@ -1,0 +1,15 @@
+# use r-cran package "reticulate" to enable to call msprime from R
+for example, in R:
+
+library(reticulate)
+source_python("my_python_script.py")
+
+where  my_python_script.py can be:
+import msprime
+import numpy
+def betacoal(n, a, mu, l, r): 
+        ts = msprime.simulate(sample_size=n, model=msprime.BetaCoalescent(alpha=a, truncation_point=1.0), mutation_rate=mu, length=l, recombination_rate=r)
+        return ts.variants()
+
+and one can then work with ts.variants()  in R
+maybe this could be included in the tutorials section, how to call msprime from R using the reticulate package ?
