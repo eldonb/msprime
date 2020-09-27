@@ -30,6 +30,7 @@
 #include "avl.h"
 #include "fenwick.h"
 #include "object_heap.h"
+#include "rate_map.h"
 
 #define MSP_MODEL_HUDSON 0
 #define MSP_MODEL_SMC 1
@@ -42,6 +43,7 @@
 
 /* Exit codes from msp_run to distinguish different reasons for exiting
  * before coalescence. */
+#define MSP_EXIT_COALESCENCE 0
 #define MSP_EXIT_MAX_EVENTS 1
 #define MSP_EXIT_MAX_TIME 2
 
@@ -54,64 +56,53 @@
 #define MSP_VERIFY_BREAKPOINTS (1 << 1)
 
 /* Flags for mutgen */
-#define MSP_KEEP_SITES 1
-#define MSP_DISCRETE_SITES 2
+#define MSP_KEEP_SITES (1 << 0)
+#define MSP_DISCRETE_SITES (1 << 1)
+#define MSP_KEPT_MUTATIONS_BEFORE_END_TIME (1 << 2)
 
 /* Pedigree states */
 #define MSP_PED_STATE_UNCLIMBED 0
 #define MSP_PED_STATE_CLIMBING 1
 #define MSP_PED_STATE_CLIMB_COMPLETE 2
 
-/* FIXME: Using these typedefs to keep the diff size small on the initial
- * tskit transition. Can remove later. */
 typedef tsk_id_t population_id_t;
-typedef tsk_id_t node_id_t;
-typedef tsk_id_t mutation_id_t;
-typedef tsk_id_t site_id_t;
-
-/* TODO int16 is surely fine, but it won't make the segment struct any smaller
- * because of alignment requirements. After tskit has been separarated,
- * we will probably want to make both population_id_t and label_id_t
- * int16_t, and then we'll reduce the size of the segment struct a
- * fair bit. It's not worth doing until then though.
- */
 typedef tsk_id_t label_id_t;
 
 typedef struct segment_t_t {
-    /* TODO change to population */
-    population_id_t population_id;
+    population_id_t population;
     label_id_t label;
-    /* During simulation we use genetic coordinates */
     double left;
     double right;
-    double left_mass;
-    double right_mass;
-    node_id_t value;
+    tsk_id_t value;
     size_t id;
     struct segment_t_t *prev;
     struct segment_t_t *next;
 } segment_t;
 
 typedef struct {
-    double left; /* TODO CHANGE THIS - not a good name! */
-    uint32_t value;
+    double position;
+    tsk_size_t value;
 } node_mapping_t;
-
-typedef struct {
-    population_id_t population_id;
-    double time;
-} sample_t;
 
 typedef struct {
     double initial_size;
     double growth_rate;
     double start_time;
     avl_tree_t *ancestors;
+    tsk_size_t num_potential_destinations;
+    tsk_id_t *potential_destinations;
 } population_t;
 
+/* Note: we might want to make a distinction here between "individual"
+ * and "pedigree individual". We might want to have a more generic
+ * individual type at some point which just consists of an array of
+ * ploidy segment pointers (one head for each strand). This struct
+ * is quite specialised for the purpose of running the pedigree
+ * simulation. */
 typedef struct individual_t_t {
     tsk_id_t id;
-    tsk_id_t tsk_id;
+    /* Note: probably simpler to make parents a list of tsk_id_ts,
+     * save a bit of pointer fiddling */
     struct individual_t_t **parents;
     avl_tree_t *segments;
     int sex;
@@ -124,7 +115,8 @@ typedef struct individual_t_t {
 typedef struct {
     individual_t *inds;
     size_t num_inds;
-    size_t ploidy;
+    /* JK We don't need the samples any more, as we can derive this
+     * from the tables. */
     individual_t **samples;
     size_t num_samples;
     avl_tree_t ind_heap;
@@ -133,8 +125,8 @@ typedef struct {
 
 typedef struct {
     double time;
-    node_id_t sample;
-    population_id_t population_id;
+    tsk_id_t sample;
+    population_id_t population;
 } sampling_event_t;
 
 /* Simulation models */
@@ -161,8 +153,7 @@ typedef struct {
 } genic_selection_trajectory_t;
 
 typedef struct _sweep_t {
-    /* TODO change the name of this to position */
-    double locus;
+    double position;
     union {
         /* Future trajectory simulation models would go here */
         genic_selection_trajectory_t genic_selection_trajectory;
@@ -174,8 +165,6 @@ typedef struct _sweep_t {
 
 typedef struct _simulation_model_t {
     int type;
-    /* For coalescent models, the reference population size used to rescale time */
-    double reference_size;
     union {
         beta_coalescent_t beta_coalescent;
         dirac_coalescent_t dirac_coalescent;
@@ -183,28 +172,12 @@ typedef struct _simulation_model_t {
     } params;
     /* If the model allocates memory this function should be non-null. */
     void (*free)(struct _simulation_model_t *model);
-    /* Time and rate conversions */
-    double (*model_time_to_generations)(struct _simulation_model_t *model, double t);
-    double (*generations_to_model_time)(struct _simulation_model_t *model, double g);
-    double (*generation_rate_to_model_rate)(
-        struct _simulation_model_t *model, double rg);
-    double (*model_rate_to_generation_rate)(
-        struct _simulation_model_t *model, double rm);
 } simulation_model_t;
 
 typedef struct {
-    double *position;
-    double *value;
-    size_t size;
-} interval_map_t;
-
-/* Recombination map */
-typedef struct {
-    interval_map_t map;
-    double total_recombination_rate;
-    double *cumulative;
-    bool discrete;
-} recomb_map_t;
+    double left;
+    tsk_size_t count;
+} overlap_count_t;
 
 typedef struct _msp_t {
     gsl_rng *rng;
@@ -212,20 +185,22 @@ typedef struct _msp_t {
     simulation_model_t model;
     bool store_migrations;
     bool store_full_arg;
-    uint32_t num_samples;
     double sequence_length;
-    recomb_map_t recomb_map;
-    double gene_conversion_rate;
-    double gene_conversion_track_length;
+    bool discrete_genome;
+    rate_map_t recomb_map;
+    rate_map_t gc_map;
+    double gc_track_length;
     uint32_t num_populations;
     uint32_t num_labels;
-    sample_t *samples;
+    uint32_t ploidy;
     double start_time;
-    tsk_treeseq_t *from_ts;
+    pedigree_t *pedigree;
+    /* Initial state for replication */
+    segment_t **root_segments;
+    overlap_count_t *initial_overlaps;
     simulation_model_t initial_model;
     double *initial_migration_matrix;
     population_t *initial_populations;
-    pedigree_t *pedigree;
     /* allocation block sizes */
     size_t avl_node_block_size;
     size_t node_mapping_block_size;
@@ -239,6 +214,7 @@ typedef struct _msp_t {
     size_t num_trapped_re_events;
     size_t num_multiple_re_events;
     size_t num_noneffective_gc_events;
+    size_t num_fenwick_rebuilds;
     /* sampling events */
     sampling_event_t *sampling_events;
     size_t num_sampling_events;
@@ -252,10 +228,12 @@ typedef struct _msp_t {
     double time;
     double *migration_matrix;
     population_t *populations;
+    avl_tree_t non_empty_populations;
     avl_tree_t breakpoints;
     avl_tree_t overlap_counts;
     /* We keep an independent Fenwick tree for each label */
-    fenwick_t *links;
+    fenwick_t *recomb_mass_index;
+    fenwick_t *gc_mass_index;
     /* memory management */
     object_heap_t avl_node_heap;
     object_heap_t node_mapping_heap;
@@ -263,11 +241,11 @@ typedef struct _msp_t {
     object_heap_t *segment_heap;
     /* The tables used to store the simulation state */
     tsk_table_collection_t *tables;
-    tsk_bookmark_t from_position;
+    tsk_bookmark_t input_position;
     /* edges are buffered in a flat array until they are squashed and flushed */
     tsk_edge_t *buffered_edges;
-    size_t num_buffered_edges;
-    size_t max_buffered_edges;
+    tsk_size_t num_buffered_edges;
+    tsk_size_t max_buffered_edges;
     /* Methods for getting the waiting time until the next common ancestor
      * event and the event are defined by the simulation model */
     double (*get_common_ancestor_waiting_time)(
@@ -278,7 +256,7 @@ typedef struct _msp_t {
 
 /* Demographic events */
 typedef struct {
-    population_id_t population_id;
+    population_id_t population;
     double initial_size;
     double growth_rate;
 } population_parameters_change_t;
@@ -295,12 +273,12 @@ typedef struct {
 } mass_migration_t;
 
 typedef struct {
-    population_id_t population_id;
+    population_id_t population;
     double proportion;
 } simple_bottleneck_t;
 
 typedef struct {
-    population_id_t population_id;
+    population_id_t population;
     double strength;
 } instantaneous_bottleneck_t;
 
@@ -318,52 +296,106 @@ typedef struct demographic_event_t_t {
     struct demographic_event_t_t *next;
 } demographic_event_t;
 
+/* The site_t and mutation_t are similar the equivalent tsk_ types,
+ * with some extra fields that we need for mutation generation. */
+typedef struct mutation_t {
+    tsk_id_t id;
+    tsk_id_t site;
+    tsk_id_t node;
+    char *derived_state;
+    tsk_size_t derived_state_length;
+    char *metadata;
+    tsk_size_t metadata_length;
+    double time;
+    struct mutation_t *parent;
+    struct mutation_t *next;
+    bool new;
+    bool keep;
+} mutation_t;
+
 typedef struct {
     double position;
-    node_id_t node;
-    const char *ancestral_state;
-    const char *derived_state;
-} infinite_sites_mutation_t;
+    char *ancestral_state;
+    tsk_size_t ancestral_state_length;
+    char *metadata;
+    tsk_size_t metadata_length;
+    mutation_t *mutations;
+    size_t mutations_length;
+    bool new;
+} site_t;
 
 typedef struct {
     size_t num_alleles;
     char **alleles;
+    tsk_size_t *allele_length;
     double *root_distribution;
     double *transition_matrix;
+} mutation_matrix_t;
+
+typedef struct {
+    int32_t mutation_type_id; // following SLiM's MutationMetadataRec
+    int64_t next_mutation_id; // following SLiM's slim_mutationid_t
+    tsk_blkalloc_t allocator;
+} slim_mutator_t;
+
+typedef struct {
+    uint64_t start_allele;
+    uint64_t next_allele;
+    tsk_blkalloc_t allocator;
+} infinite_alleles_t;
+
+typedef struct _mutation_model_t {
+    union {
+        mutation_matrix_t mutation_matrix;
+        slim_mutator_t slim_mutator;
+        infinite_alleles_t infinite_alleles;
+        /* Other known mutation models */
+    } params;
+    void (*print_state)(struct _mutation_model_t *model, FILE *out);
+    int (*free)(struct _mutation_model_t *model);
+    int (*choose_root_state)(
+        struct _mutation_model_t *model, gsl_rng *rng, site_t *site);
+    int (*transition)(struct _mutation_model_t *model, gsl_rng *rng,
+        const char *parent_allele, tsk_size_t parent_allele_length,
+        const char *parent_metadata, tsk_size_t parent_metadata_length,
+        mutation_t *mutation);
 } mutation_model_t;
 
 typedef struct {
     gsl_rng *rng;
-    interval_map_t *rate_map;
+    tsk_table_collection_t *tables;
     double start_time;
     double end_time;
     size_t block_size;
+    rate_map_t rate_map;
     avl_tree_t sites;
     tsk_blkalloc_t allocator;
     mutation_model_t *model;
 } mutgen_t;
 
-int msp_alloc(msp_t *self, size_t num_samples, sample_t *samples,
-    recomb_map_t *recomb_map, tsk_table_collection_t *from_ts_tables, gsl_rng *rng);
-int msp_set_start_time(msp_t *self, double start_time);
-int msp_set_simulation_model_hudson(msp_t *self, double population_size);
-int msp_set_simulation_model_smc(msp_t *self, double population_size);
-int msp_set_simulation_model_smc_prime(msp_t *self, double population_size);
-int msp_set_simulation_model_dtwf(msp_t *self, double population_size);
-int msp_set_simulation_model_wf_ped(msp_t *self, double population_size);
-int msp_set_simulation_model_dirac(
-    msp_t *self, double population_size, double psi, double c);
-int msp_set_simulation_model_beta(
-    msp_t *self, double population_size, double alpha, double truncation_point);
-int msp_set_simulation_model_sweep_genic_selection(msp_t *self, double population_size,
-    double position, double start_frequency, double end_frequency, double alpha,
-    double dt);
+int msp_alloc(msp_t *self, tsk_table_collection_t *tables, gsl_rng *rng);
+int msp_set_simulation_model_hudson(msp_t *self);
+int msp_set_simulation_model_smc(msp_t *self);
+int msp_set_simulation_model_smc_prime(msp_t *self);
+int msp_set_simulation_model_dtwf(msp_t *self);
+int msp_set_simulation_model_wf_ped(msp_t *self);
+int msp_set_simulation_model_dirac(msp_t *self, double psi, double c);
+int msp_set_simulation_model_beta(msp_t *self, double alpha, double truncation_point);
+int msp_set_simulation_model_sweep_genic_selection(msp_t *self, double position,
+    double start_frequency, double end_frequency, double alpha, double dt);
 
+int msp_set_start_time(msp_t *self, double start_time);
 int msp_set_store_migrations(msp_t *self, bool store_migrations);
 int msp_set_store_full_arg(msp_t *self, bool store_full_arg);
-int msp_set_num_populations(msp_t *self, size_t num_populations);
-int msp_set_dimensions(msp_t *self, size_t num_populations, size_t num_labels);
-int msp_set_gene_conversion_rate(msp_t *self, double rate, double track_length);
+int msp_set_ploidy(msp_t *self, int ploidy);
+int msp_set_recombination_map(msp_t *self, size_t size, double *position, double *rate);
+int msp_set_recombination_rate(msp_t *self, double rate);
+int msp_set_gene_conversion_map(
+    msp_t *self, size_t size, double *position, double *rate);
+int msp_set_gene_conversion_rate(msp_t *self, double rate);
+int msp_set_gene_conversion_track_length(msp_t *self, double track_length);
+int msp_set_discrete_genome(msp_t *self, bool is_discrete);
+int msp_set_num_labels(msp_t *self, size_t num_labels);
 int msp_set_node_mapping_block_size(msp_t *self, size_t block_size);
 int msp_set_segment_block_size(msp_t *self, size_t block_size);
 int msp_set_avl_node_block_size(msp_t *self, size_t block_size);
@@ -383,21 +415,6 @@ int msp_add_instantaneous_bottleneck(
     msp_t *self, double time, int population_id, double strength);
 int msp_add_census_event(msp_t *self, double time);
 
-int alloc_individual(individual_t *ind, size_t ploidy);
-int msp_alloc_pedigree(msp_t *self, size_t num_inds, size_t ploidy);
-int msp_free_pedigree(msp_t *self);
-int msp_set_pedigree(msp_t *self, size_t num_rows, int *inds, int *parents,
-    double *times, uint32_t *is_sample);
-int msp_pedigree_load_pop(msp_t *self);
-void msp_check_samples(msp_t *self);
-int msp_pedigree_build_ind_queue(msp_t *self);
-int msp_pedigree_push_ind(msp_t *self, individual_t *ind);
-int msp_pedigree_pop_ind(msp_t *self, individual_t **ind);
-int msp_pedigree_add_individual_segment(
-    msp_t *self, individual_t *ind, segment_t *segment, size_t parent_ix);
-int msp_pedigree_climb(msp_t *self);
-void msp_print_pedigree_inds(msp_t *self, FILE *out);
-
 int msp_initialise(msp_t *self);
 int msp_run(msp_t *self, double max_time, unsigned long max_events);
 int msp_debug_demography(msp_t *self, double *end_time);
@@ -411,7 +428,6 @@ int msp_get_ancestors(msp_t *self, segment_t **ancestors);
 int msp_get_breakpoints(msp_t *self, size_t *breakpoints);
 int msp_get_migration_matrix(msp_t *self, double *migration_matrix);
 int msp_get_num_migration_events(msp_t *self, size_t *num_migration_events);
-int msp_get_samples(msp_t *self, sample_t **samples);
 int msp_get_population_configuration(
     msp_t *self, size_t population_id, double *initial_size, double *growth_rate);
 int msp_compute_population_size(
@@ -421,13 +437,12 @@ int msp_is_completed(msp_t *self);
 simulation_model_t *msp_get_model(msp_t *self);
 const char *msp_get_model_name(msp_t *self);
 bool msp_get_store_migrations(msp_t *self);
-double msp_get_recombination_rate(msp_t *self);
-double msp_get_gene_conversion_rate(msp_t *self);
 double msp_get_time(msp_t *self);
 size_t msp_get_num_samples(msp_t *self);
 size_t msp_get_num_loci(msp_t *self);
 size_t msp_get_num_populations(msp_t *self);
 size_t msp_get_num_labels(msp_t *self);
+size_t msp_get_num_population_ancestors(msp_t *self, tsk_id_t population);
 size_t msp_get_num_ancestors(msp_t *self);
 size_t msp_get_num_breakpoints(msp_t *self);
 size_t msp_get_num_nodes(msp_t *self);
@@ -441,59 +456,28 @@ size_t msp_get_num_rejected_common_ancestor_events(msp_t *self);
 size_t msp_get_num_recombination_events(msp_t *self);
 size_t msp_get_num_gene_conversion_events(msp_t *self);
 
-int interval_map_alloc(
-    interval_map_t *self, size_t size, double *position, double *value);
-int interval_map_alloc_single(
-    interval_map_t *self, double sequence_length, double value);
-int interval_map_free(interval_map_t *self);
-void interval_map_print_state(interval_map_t *self, FILE *out);
-double interval_map_get_sequence_length(interval_map_t *self);
-size_t interval_map_get_size(interval_map_t *self);
-size_t interval_map_get_num_intervals(interval_map_t *self);
-size_t interval_map_get_index(interval_map_t *self, double x);
-
-typedef double (*msp_convert_func)(void *obj, double rate);
-
-int recomb_map_alloc_uniform(
-    recomb_map_t *self, double sequence_length, double rate, bool discrete);
-int recomb_map_alloc(
-    recomb_map_t *self, size_t size, double *position, double *rate, bool discrete);
-int recomb_map_copy(recomb_map_t *to, recomb_map_t *from);
-int recomb_map_free(recomb_map_t *self);
-double recomb_map_get_sequence_length(recomb_map_t *self);
-bool recomb_map_get_discrete(recomb_map_t *self);
-double recomb_map_get_total_recombination_rate(recomb_map_t *self);
-void recomb_map_convert_rates(recomb_map_t *self, msp_convert_func convert, void *obj);
-size_t recomb_map_get_size(recomb_map_t *self);
-int recomb_map_get_positions(recomb_map_t *self, double *positions);
-int recomb_map_get_rates(recomb_map_t *self, double *rates);
-
-void recomb_map_print_state(recomb_map_t *self, FILE *out);
-
-double recomb_map_mass_between_left_exclusive(
-    recomb_map_t *self, double left, double right);
-double recomb_map_mass_between(recomb_map_t *self, double left, double right);
-double recomb_map_mass_to_position(recomb_map_t *self, double mass);
-double recomb_map_position_to_mass(recomb_map_t *self, double position);
-double recomb_map_shift_by_mass(recomb_map_t *self, double pos, double mass);
-double recomb_map_sample_poisson(recomb_map_t *self, gsl_rng *rng, double start);
-
-int mutation_model_alloc(mutation_model_t *self, size_t num_alleles, char **alleles,
-    double *root_distribution, double *transition_matrix);
+int matrix_mutation_model_factory(mutation_model_t *self, int model);
+int matrix_mutation_model_alloc(mutation_model_t *self, size_t num_alleles,
+    char **alleles, size_t *allele_length, double *root_distribution,
+    double *transition_matrix);
+int slim_mutation_model_alloc(mutation_model_t *self, int32_t mutation_type_id,
+    int64_t next_mutation_id, size_t block_size);
+int infinite_alleles_mutation_model_alloc(
+    mutation_model_t *self, uint64_t start_allele, tsk_flags_t options);
 int mutation_model_free(mutation_model_t *self);
-size_t mutation_model_get_num_alleles(mutation_model_t *self);
 void mutation_model_print_state(mutation_model_t *self, FILE *out);
-int mutation_model_factory(mutation_model_t *self, int model);
 
-int mutgen_alloc(mutgen_t *self, gsl_rng *rng, interval_map_t *rate_map,
+int mutgen_alloc(mutgen_t *self, gsl_rng *rng, tsk_table_collection_t *tables,
     mutation_model_t *model, size_t mutation_block_size);
 int mutgen_set_time_interval(mutgen_t *self, double start_time, double end_time);
+int mutgen_set_rate(mutgen_t *self, double rate);
+int mutgen_set_rate_map(mutgen_t *self, size_t size, double *position, double *rate);
 int mutgen_free(mutgen_t *self);
-int mutgen_generate(mutgen_t *self, tsk_table_collection_t *tables, int flags);
+int mutgen_generate(mutgen_t *self, int flags);
 void mutgen_print_state(mutgen_t *self, FILE *out);
 
 /* Functions exposed here for unit testing. Not part of public API. */
 int msp_multi_merger_common_ancestor_event(
-    msp_t *self, avl_tree_t *ancestors, avl_tree_t *Q, uint32_t k);
+    msp_t *self, avl_tree_t *ancestors, avl_tree_t *Q, uint32_t k, uint32_t num_pots);
 
 #endif /*__MSPRIME_H__*/

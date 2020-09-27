@@ -623,7 +623,8 @@ To fix this, let's add some migration events to the specific demographic history
 Migrations
 **********
 
-With msprime, you can specify continual rates of migrations between populations, as well as one-off mass migrations.
+With msprime, you can specify continual rates of migrations between
+populations, as well as one-off mass migrations.
 
 Constant migration
 ------------------
@@ -632,9 +633,18 @@ Constant migration
    :width: 500px
    :alt: 2 populations with constant migration rate.
 
-Migration rates between the populations can be specified as the elements of an *N* by *N* numpy array, and given to :meth:`msprime.simulate` via the ``migration_matrix`` argument. The diagonal elements of this array must each be 0, and the *(i, j)* th element specifies the fraction of population *i* that consists of new migrants from population *j* in each generation.
+Migration rates between the populations can be specified as the elements of an
+*N* by *N* numpy array, and given to :meth:`msprime.simulate` via the
+``migration_matrix`` argument. The diagonal elements of this array must each be
+0, and the *(i, j)* th element specifies the expected number of migrants moving
+from population *j* to population *i* per generation, divided by the size of
+population *i*.  When this rate is small (close to 0), it is approximately
+equal to the fraction of population *i* that consists of new migrants from
+population *j* in each generation.
 
-For instance, the following migration matrix specifies that in each generation, 5% of population 0 consists of migrants from population 1, and 2% of population 1 consists of migrants from population 0.
+For instance, the following migration matrix specifies that in each generation,
+approximately 5% of population 0 consists of migrants from population 1, and
+approximately 2% of population 1 consists of migrants from population 0.
 
 
 .. code-block:: python
@@ -650,7 +660,9 @@ For instance, the following migration matrix specifies that in each generation, 
             random_seed = 17,
             recombination_rate = 1e-7)
 
-One consequence of specifying :meth:`msprime.PopulationConfiguration` objects is that each of the simulated nodes will now belong to one of our specified populations:
+One consequence of specifying :meth:`msprime.PopulationConfiguration` objects
+is that each of the simulated nodes will now belong to one of our specified
+populations:
 
 .. code-block:: python
 
@@ -1000,10 +1012,192 @@ before running your simulations.
     # 0 |   500      500                0 |     0        0
     # 1 |   500      500                0 |     0        0
 
+
+.. _sec_tutorial_demography_complete_example:
+
+******************
+A complete example
+******************
+
+To illustrate ``msprime``'s demography API on a real example from the
+literature, we implement the
+`Gutenkunst et al. <http://dx.doi.org/10.1371/journal.pgen.1000695>`_
+out-of-Africa model.
+The parameter values used are taken from
+`Table 1 <http://dx.doi.org/10.1371/journal.pgen.1000695.t001>`_.
+Here is an illustration of the model using the `demography
+package <https://github.com/apragsdale/demography>`__
+(see also `Figure 2B <http://dx.doi.org/10.1371/journal.pgen.1000695.g002>`_
+of the Gutenkunst et. al paper):
+
+.. image:: _static/Gutenkunst_OOA_diagram.svg
+   :width: 500px
+   :align: center
+   :alt: Schematic of Gutenkunst et al. (2009) out-of-Africa model.
+
+The code below is provided as an example to help you develop your
+own models. If you want to use this precise model in your analyses
+we strongly recommend using :ref:`stdpopsim <stdpopsim:sec_introduction>`,
+which provides a community maintained :ref:`catalog <stdpopsim:sec_catalog>`
+of simulation species information and demographic models. The
+model given here is identical to the
+:ref:`HomSam/OutOfAfrica_3G09 <stdpopsim:sec_catalog_homsap_models_outofafrica_3g09>`
+model.
+
+.. warning::
+
+    The version of this model in the tutorial from 31 May 2016 to 29 May 2020
+    (on the stable branch) was **incorrect**. Specifically, it mistakenly
+    allowed for migration to continue beyond the merger of the African and
+    Eurasian bottleneck populations. This has now been fixed, but if you had
+    copied this model from the tutorial for your own analyses, you should
+    update your model code or use the implementation that has been verified in
+    :ref:`stdpopsim project <stdpopsim:sec_introduction>`. See `here
+    <https://github.com/jeromekelleher/msprime-model-errors>`__ for more
+    details on the faulty model and its likely effects on downstream analyses.
+
+Coalescent simulation moves from the present back into the past,
+so times are in units of generations *ago*, and we build the model
+with most recent events first.
+
+
+.. literalinclude:: examples/out_of_africa.py
+
+Once we have defined the model, it is a *very* good idea to check
+the implementation using the :class:`.DemographyDebugger`:
+
+.. code-block:: python
+
+    # Use the demography debugger to print out the demographic history
+    # that we have just described.
+    dd = msprime.DemographyDebugger(**out_of_africa())
+    dd.print_history()
+
+    # =============================
+    # Epoch: 0 -- 848.0 generations
+    # =============================
+    #      start     end      growth_rate |     0        1        2
+    #    -------- --------       -------- | -------- -------- --------
+    # 0 |1.23e+04 1.23e+04              0 |     0      3e-05   1.9e-05
+    # 1 |2.97e+04   1e+03           0.004 |   3e-05      0     9.6e-05
+    # 2 |5.41e+04    510           0.0055 |  1.9e-05  9.6e-05     0
+    #
+    # Events @ generation 848.0
+    #    - Mass migration: Lineages moved with probability 1.0 backwards in time with source 2 & dest 1
+    #                      (equivalent to migration from 1 to 2 forwards in time)
+    #    - Migration rate change to 0 everywhere
+    #    - Migration rate change for (0, 1) to 0.00025
+    #    - Migration rate change for (1, 0) to 0.00025
+    #    - Population parameter change for 1: initial_size -> 2100 growth_rate -> 0
+    # ==================================
+    # Epoch: 848.0 -- 5600.0 generations
+    # ==================================
+    #      start     end      growth_rate |     0        1        2
+    #    -------- --------       -------- | -------- -------- --------
+    # 0 |1.23e+04 1.23e+04              0 |     0     0.00025     0
+    # 1 | 2.1e+03  2.1e+03              0 |  0.00025     0        0
+    # 2 |   510   2.27e-09         0.0055 |     0        0        0
+    #
+    # Events @ generation 5600.0
+    #    - Mass migration: Lineages moved with probability 1.0 backwards in time with source 1 & dest 0
+    #                    (equivalent to migration from 0 to 1 forwards in time)
+    #    - Migration rate change to 0 everywhere
+    # ===================================
+    # Epoch: 5600.0 -- 8800.0 generations
+    # ===================================
+    #      start     end      growth_rate |     0        1        2
+    #    -------- --------       -------- | -------- -------- --------
+    # 0 |1.23e+04 1.23e+04              0 |     0        0        0
+    # 1 | 2.1e+03  2.1e+03              0 |     0        0        0
+    # 2 |2.27e-09 5.17e-17         0.0055 |     0        0        0
+    #
+    # Events @ generation 8800.0
+    #    - Population parameter change for 0: initial_size -> 7300
+    # ================================
+    # Epoch: 8800.0 -- inf generations
+    # ================================
+    #      start     end      growth_rate |     0        1        2
+    #    -------- --------       -------- | -------- -------- --------
+    # 0 | 7.3e+03  7.3e+03              0 |     0        0        0
+    # 1 | 2.1e+03  2.1e+03              0 |     0        0        0
+    # 2 |5.17e-17     0            0.0055 |     0        0        0
+
+Once you are satisfied that the demographic history that you have built
+is correct, it can then be simulated by calling the :func:`.simulate`
+function:
+
+.. code-block:: python
+
+    ts = msprime.simulate(**out_of_africa())
+
 .. _sec_advanced_features:
 
 Advanced features
 *****************
+
+.. _sec_advanced_features_logging:
+
+*******
+Logging
+*******
+
+Msprime uses the Python :mod:`logging` infrastructure to help debugging
+complex simulations. Messages at the INFO level are high-level information
+about the state of the current simulation, such as switches in simulation
+model, etc. While it is straightforward to set up logging messages using
+the built-in Python methods, the `daiquiri
+<https://daiquiri.readthedocs.io/en/latest/>`_ is a bit more convenient.
+For example,
+
+.. literalinclude:: examples/logging_info.py
+
+Running this code we would get output something like the following:
+
+.. code-block:: none
+
+    2020-06-24 16:02:20,983 [11188] INFO     msprime.ancestry: Running model {'name': 'dtwf'} until max time: 100.000000
+    2020-06-24 16:02:20,984 [11188] INFO     msprime.ancestry: Running model {'name': 'hudson'} until max time: inf
+    2020-06-24 16:02:20,984 [11188] INFO     msprime.ancestry: Completed at time=1449.4 nodes=19 edges=18
+
+
+When running larger simulations and trying to figure out when
+they might finish, it can be helpful to use the DEBUG logging output.
+For example,
+
+.. literalinclude:: examples/logging_debug.py
+
+which gives us:
+
+.. code-block:: none
+
+    2020-06-24 16:11:33,373 [11729] INFO     msprime.ancestry: Running model {'name': 'hudson'} until max time: inf
+    2020-06-24 16:11:33,396 [11729] DEBUG    msprime.ancestry: time=0.0444792 ancestors=90162
+    2020-06-24 16:11:33,418 [11729] DEBUG    msprime.ancestry: time=0.0979881 ancestors=80314
+    2020-06-24 16:11:33,438 [11729] DEBUG    msprime.ancestry: time=0.167461 ancestors=70518
+    2020-06-24 16:11:33,466 [11729] DEBUG    msprime.ancestry: time=0.258912 ancestors=60734
+    2020-06-24 16:11:33,501 [11729] DEBUG    msprime.ancestry: time=0.386571 ancestors=51002
+    2020-06-24 16:11:33,542 [11729] DEBUG    msprime.ancestry: time=0.575475 ancestors=41292
+    2020-06-24 16:11:33,596 [11729] DEBUG    msprime.ancestry: time=0.872121 ancestors=31704
+    2020-06-24 16:11:33,668 [11729] DEBUG    msprime.ancestry: time=1.42071 ancestors=22228
+    2020-06-24 16:11:33,763 [11729] DEBUG    msprime.ancestry: time=2.75437 ancestors=13042
+    2020-06-24 16:11:33,906 [11729] DEBUG    msprime.ancestry: time=8.80469 ancestors=4752
+    2020-06-24 16:11:34,018 [11729] DEBUG    msprime.ancestry: time=277.713 ancestors=416
+    2020-06-24 16:11:34,034 [11729] DEBUG    msprime.ancestry: time=6352.95 ancestors=142
+    2020-06-24 16:11:34,042 [11729] DEBUG    msprime.ancestry: time=20955.5 ancestors=104
+    2020-06-24 16:11:34,050 [11729] DEBUG    msprime.ancestry: time=40321.8 ancestors=83
+    2020-06-24 16:11:34,056 [11729] DEBUG    msprime.ancestry: time=72735.7 ancestors=74
+    2020-06-24 16:11:34,059 [11729] INFO     msprime.ancestry: Completed at time=235063 nodes=207110 edges=233940
+
+
+In this example we run a reasonably large simulation and turn on
+the DEBUG output. This will then periodically (every 10,000 simulation
+events) print out the current time in the simulation, and the
+number of extant ancestral lineages.
+
+.. warning:: The format of these logging messages is not fixed and may change
+    arbitrarily in the future. If you need to obtain the information within
+    them, please open an issue on GitHub so that we can provide a documented
+    API for this.
 
 *********************
 Parsing species trees
@@ -1281,34 +1475,13 @@ API for replication: by providing the ``num_replicates`` argument to the
 in a straightforward manner. Here is an example where we compare the
 analytical results for the number of segregating sites with simulations:
 
-.. code-block:: python
-
-    import msprime
-    import numpy as np
-
-    def segregating_sites_example(n, theta, num_replicates):
-        S = np.zeros(num_replicates)
-        replicates = msprime.simulate(
-            Ne=0.5,
-            sample_size=n,
-            mutation_rate=theta / 2,
-            num_replicates=num_replicates)
-        for j, tree_sequence in enumerate(replicates):
-            S[j] = tree_sequence.num_sites
-        # Now, calculate the analytical predictions
-        S_mean_a = np.sum(1 / np.arange(1, n)) * theta
-        S_var_a = (
-            theta * np.sum(1 / np.arange(1, n)) +
-            theta**2 * np.sum(1 / np.arange(1, n)**2))
-        print("              mean              variance")
-        print("Observed      {}\t\t{}".format(np.mean(S), np.var(S)))
-        print("Analytical    {:.5f}\t\t{:.5f}".format(S_mean_a, S_var_a))
+.. literalinclude:: examples/segregating_sites.py
 
 Running this code, we get:
 
 .. code-block:: python
 
-    segregating_sites_example(10, 5, 100000)
+    segregating_sites(10, 5, 100000)
     #          mean              variance
     # Observed      14.17893          53.0746740551
     # Analytical    14.14484          52.63903
@@ -1438,63 +1611,7 @@ First, we define a simple Wright-Fisher simulator which returns a tree sequence
 with the properties that we require (please see the :ref:`API <sec_api_simulate_from>`
 section for a formal description of these properties):
 
-.. code-block:: python
-
-    import random
-    import numpy as np
-
-    def wright_fisher(N, T, L=100, random_seed=None):
-        """
-        Simulate a Wright-Fisher population of N haploid individuals with L
-        discrete loci for T generations. Based on Algorithm W from
-        https://www.biorxiv.org/content/biorxiv/early/2018/01/16/248500.full.pdf
-        """
-        random.seed(random_seed)
-        tables = msprime.TableCollection(L)
-        P = np.arange(N, dtype=int)
-        # Mark the initial generation as samples so that we remember these nodes.
-        for j in range(N):
-            tables.nodes.add_row(time=T, flags=msprime.NODE_IS_SAMPLE)
-        t = T
-        while t > 0:
-            t -= 1
-            Pp = P.copy()
-            for j in range(N):
-                u = tables.nodes.add_row(time=t, flags=0)
-                Pp[j] = u
-                a = random.randint(0, N - 1)
-                b = random.randint(0, N - 1)
-                x = random.randint(1, L - 1)
-                tables.edges.add_row(0, x, P[a], u)
-                tables.edges.add_row(x, L, P[b], u)
-            P = Pp
-
-        # Now do some table manipulations to ensure that the tree sequence
-        # that we output has the form that msprime needs to finish the
-        # simulation. Much of the complexity here is caused by the tables API
-        # not allowing direct access to memory, which will change soon.
-
-        # Mark the extant population as samples also
-        flags = tables.nodes.flags
-        flags[P] = msprime.NODE_IS_SAMPLE
-        tables.nodes.set_columns(flags=flags, time=tables.nodes.time)
-        tables.sort()
-        # Simplify with respect to the current generation, but ensuring we keep the
-        # ancient nodes from the initial population.
-        tables.simplify()
-        # Unmark the initial generation as samples
-        flags = tables.nodes.flags
-        time = tables.nodes.time
-        flags[:] = 0
-        flags[time == 0] = msprime.NODE_IS_SAMPLE
-        # The final tables must also have at least one population which
-        # the samples are assigned to
-        tables.populations.add_row()
-        tables.nodes.set_columns(
-            flags=flags, time=time,
-            population=np.zeros_like(tables.nodes.population))
-        return tables.tree_sequence()
-
+.. literalinclude:: examples/wright_fisher.py
 
 We then run a tiny forward simulation of 10 two-locus individuals
 for 5 generations, and print out the resulting trees:
@@ -1843,23 +1960,23 @@ Multiple merger coalescents
 ***************************
 
 ``msprime`` can simulate several multiple merger coalescent models,
-in which any number of lineages can coalesce in up to four simultaneous
-mergers. These can often be appropriate models when the distribution of
+in which any number of lineages can coalesce in a number of simultaneous
+mergers. These models are often appropriate when the distribution of
 offspring numbers among individuals in the population is highly skewed.
-Provided are the classes of Beta-Xi-coalescents and Dirac-Xi-coalescents.
+The two provided models are the Beta-coalescent and the Dirac-coalescent.
 
-The Beta-Xi-coalescent can be simulated as follows:
+The diploid Beta-Xi-coalescent can be simulated as follows:
 
 .. code-block:: python
 
     def beta_multiple_merger_example():
-        ts = msprime.simulate(
-            sample_size=10, random_seed=1,
+        ts = msprime.sim_ancestry(
+            sample_size=5, ploidy=2, random_seed=1,
             model=msprime.BetaCoalescent(alpha=1.001, truncation_point=1))
         tree = ts.first()
         print(tree.draw(format="unicode"))
 
-Running this code we get::
+Running this code, we get::
 
          16
      ┏━━━━┻━━━┓
@@ -1883,13 +2000,13 @@ no multiple mergers for small sample sizes:
 .. code-block:: python
 
     def beta_few_multiple_mergers_example():
-        ts = msprime.simulate(
-            sample_size=10, random_seed=1,
+        ts = msprime.sim_ancestry(
+            sample_size=5, ploidy=2, random_seed=1,
             model=msprime.BetaCoalescent(alpha=1.8, truncation_point=1))
         tree = ts.first()
         print(tree.draw(format="unicode"))
 
-Running this code we get::
+Running this code, we get::
 
          18
       ┏━━━┻━━━┓
@@ -1911,15 +2028,44 @@ Running this code we get::
     ┃ ┃ ┃ ┃ ┃ ┃ ┃ ┃ ┏┻┓
     5 2 3 7 8 0 6 9 1 4
 
-The timescale of the Beta-Xi-coalescent depends nonlinearly on both :math:`\alpha`
-and the effective population size :math:`N_e` as detailed in
-:ref:`sec_api_simulation_models_multiple_mergers`. For a fixed :math:`\alpha`,
-a unit of coalescent time is proportional to :math:`N_e^{\alpha - 1}` generations,
-albeit with a complicated constant of proportionality that depends on :math:`\alpha`.
-The dependence on :math:`\alpha` for fixed :math:`N_e` is not monotone.
-Since two lineages merge in 0.5 units of coalescent time on average regadless of
-:math:`N_e` and :math:`\alpha`, the time to their most recent common ancestor depends
-on both of these parameters when measured in generations.
+Multiple mergers still take place in a haploid simulaton, but only one merger
+can take place at a given time:
+
+.. code-block:: python
+
+    def beta_haploid_multiple_merger_example():
+        ts = msprime.sim_ancestry(
+            sample_size=10, ploidy=1, random_seed=1,
+            model=msprime.BetaCoalescent(alpha=1.001, truncation_point=1))
+        tree = ts.first()
+        print(tree.draw(format="unicode"))
+
+Running this code, we get::
+
+       14
+    ┏━┳━┻━━━┓
+    ┃ ┃    13
+    ┃ ┃ ┏━━━┻━━━┓
+    ┃ ┃ ┃      12
+    ┃ ┃ ┃ ┏━┳━━━╋━━━━┓
+    ┃ ┃ ┃ ┃ ┃   ┃   11
+    ┃ ┃ ┃ ┃ ┃   ┃   ┏┻┓
+    ┃ ┃ ┃ ┃ ┃  10   ┃ ┃
+    ┃ ┃ ┃ ┃ ┃ ┏━╋━┓ ┃ ┃
+    1 2 0 5 7 3 4 9 6 8
+
+A haploid simulation results in larger individual mergers than a polyploid simulation
+because large mergers typically get broken up into multiple simultaneous mergers
+in the polyploid model.
+
+The number of generations between merger events in the Beta-coalescent depends
+nonlinearly on both :math:`\alpha` and the effective population size :math:`N_e`
+as detailed in :ref:`sec_api_simulation_models_multiple_mergers`.
+For a fixed :math:`\alpha`, the number of generations between common ancestor events
+is proportional to :math:`N_e^{\alpha - 1}`, albeit with a complicated constant of
+proportionality that depends on :math:`\alpha`. The dependence on :math:`\alpha`
+for fixed :math:`N_e` is not monotone. Thus, branch lengths and the number of
+generations until a most recent common ancestor depend on both of these parameters.
 
 To illustrate, for :math:`\alpha` close to 2 the relationship between effective
 population size and number of generations is almost linear:
@@ -1927,164 +2073,113 @@ population size and number of generations is almost linear:
 .. code-block:: python
 
     def beta_high_scaling_example():
-        ts = msprime.simulate(
-            sample_size=2, random_seed=1,
-            model=msprime.BetaCoalescent(reference_size=1,
-                alpha=1.9, truncation_point=1))
+        ts = msprime.sim_ancestry(
+            sample_size=1, ploidy=2, random_seed=1, population_size=10,
+            model=msprime.BetaCoalescent(alpha=1.99, truncation_point=1))
         tree = ts.first()
         print(tree.tmrca(0,1))
-        ts = msprime.simulate(
-            sample_size=2, random_seed=1,
-            model=msprime.BetaCoalescent(reference_size=100,
-                alpha=1.9, truncation_point=1))
+        ts = msprime.sim_ancestry(
+            sample_size=1, ploidy=2, random_seed=1, population_size=1000,
+            model=msprime.BetaCoalescent(alpha=1.99, truncation_point=1))
         tree = ts.first()
         print(tree.tmrca(0,1))
 
 which results in::
 
-    1.5705367504768712
-    99.09416974894381
+    0.14959691919068155
+    14.286394871874865
 
 For :math:`\alpha` close to 1 the effective population size has little effect:
 
 .. code-block:: python
 
     def beta_low_scaling_example():
-        ts = msprime.simulate(
-            sample_size=2, random_seed=1,
-            model=msprime.BetaCoalescent(reference_size=1,
-                alpha=1.1, truncation_point=1))
+        ts = msprime.sim_ancestry(
+            sample_size=1, ploidy=2, random_seed=1, population_size=10,
+            model=msprime.BetaCoalescent(alpha=1.1, truncation_point=1))
         tree = ts.first()
         print(tree.tmrca(0,1))
-        ts = msprime.simulate(
-            sample_size=2, random_seed=1,
-            model=msprime.BetaCoalescent(reference_size=100,
-                alpha=1.1, truncation_point=1))
+        ts = msprime.sim_ancestry(
+            sample_size=1, ploidy=2, random_seed=1, population_size=1000,
+            model=msprime.BetaCoalescent(alpha=1.1, truncation_point=1))
         tree = ts.first()
         print(tree.tmrca(0,1))
 
 which gives::
 
-    7.058990342664795
-    11.18774573973818
+    16.311807036386615
+    25.85247192870844
 
-The Dirac-Xi-coalescent is simulated similarly:
+The Dirac-coalescent is simulated similarly in both the diploid case:
 
 .. code-block:: python
 
     def dirac_multiple_merger_example():
-        ts = msprime.simulate(
-            sample_size=10, random_seed=1,
+        ts = msprime.sim_ancestry(
+            sample_size=5, ploidy=2, random_seed=1,
             model=msprime.DiracCoalescent(psi=0.9, c=10))
         tree = ts.first()
         print(tree.draw(format="unicode"))
 
 which gives::
 
-           14
-       ┏━━━━┻━━━┓
-       ┃       13
-       ┃      ┏━┻━━┓
-      12      ┃    ┃
-    ┏━┳┻━━┓   ┃    ┃
-    ┃ ┃  11   ┃   10
-    ┃ ┃ ┏━╋━┓ ┃ ┏━┳┻┳━┓
-    2 6 3 4 8 1 0 5 7 9
+       15
+     ┏━━┻━━━┓
+     ┃     14
+     ┃  ┏━━━┻━━━┓
+     ┃  ┃      13
+     ┃  ┃    ┏━━┻━━━┓
+    12  ┃    ┃      ┃
+    ┏┻┓ ┃    ┃      ┃
+    ┃ ┃ ┃   10     11
+    ┃ ┃ ┃ ┏━┳┻┳━┓ ┏━╋━┓
+    1 2 6 0 5 7 9 3 4 8
 
-Larger values of the parameter :math:`c > 0` result in more frequent multiple
-mergers, while larger values of :math:`0 < \psi \leq 1` result in multiple mergers
-with more participating lineages. Setting either parameter to 0 would correspond
-to the standard coalescent.
-
-The Dirac-Xi-coalescent is obtained as the infinite population scaling limit of
-Moran models, and therefore coalescent time is measured in units of
-:math:`N_e^2` generations. However, under a Moran model, the
-population-rescaled recombination rate is still obtained from the per-generation
-recombination probability by rescaling with :math:`N_e`.
-The overall effect is that coalescent branch lengths scale with the square of the
-effective population size in units of generations, and thus so do other quantities
-which depend on branch lengths such as the number of mutations, while the number of
-recombinations scales linearly.
+and in the haploid case:
 
 .. code-block:: python
 
-    def dirac_scaling_example():
-        ts = msprime.simulate(
-            sample_size=10, random_seed=1,
-            recombination_rate=1e-2, mutation_rate=1e-2,
-            model=msprime.DiracCoalescent(reference_size=1000, psi=0.01, c=1),
-            num_replicates=100)
-        trees = 0
-        sites = 0
-        for t in ts:
-            trees = trees + t.num_trees
-            sites = sites + t.num_sites
-        print(sites / trees)
+    def dirac_haploid_multiple_merger_example():
+        ts = msprime.sim_ancestry(
+            sample_size=10, ploidy=1, random_seed=1,
+            model=msprime.DiracCoalescent(psi=0.9, c=10))
+        tree = ts.first()
+        print(tree.draw(format="unicode"))
 
-Running this code results in::
+which gives::
 
-    1241.8241770462635
+        11
+    ┏━━━━┻━━━━┓
+    ┃        10
+    ┃ ┏━┳━┳━┳━╋━┳━┳━┳━┓
+    1 0 2 3 4 5 6 7 8 9
 
-which is larger than :math:`N_e = 1000` because not every recombination
-results in a new tree.
+As with the Beta-coalescent, a haploid simulation results in larger individual
+mergers than a polyploid simulation because large mergers typically get broken
+up into multiple simultaneous mergers in the polyploid model. Larger values
+of the parameter :math:`c > 0` result in more frequent multiple mergers,
+while larger values of :math:`0 < \psi \leq 1` result in multiple mergers
+with more participating lineages. Setting either parameter to 0 would correspond
+to the standard coalescent.
 
-This behaviour is a consequence of the time and parameter scalings under the Moran
-model, as well as the fact that ``msprime`` simulates recombinations on the coalescent
-time scale, but mutations on trees in units of generations. The rates of mutations
-and recombinations can be made commensurate by either dividing the mutation rate by
-:math:`N_e`, or multiplying the recombination rate by :math:`N_e`.
-=======
+The Dirac-coalescent is obtained as the infinite population scaling limit of
+Moran models, and therefore branch lengths are proportional to :math:`N_e^2`
+generations, as opposed to :math:`N_e` generations under the standard coalescent.
+
+*********
 Old stuff
 *********
 
 .. todo::
-    The material in this section are leftovers from an older version of the docs.
+    The material in this section are leftovers from an older version of the
+    tutorial. Let's figure out where it goes best.
 
 In the following example, we calculate the mean coalescence time for
 a pair of lineages sampled in different subpopulations in a symmetric island
 model, and compare this with the analytical expectation.
 
-.. code-block:: python
 
-    import msprime
-    import numpy as np
-
-    def migration_example(num_replicates=10**4):
-        # M is the overall symmetric migration rate, and d is the number
-        # of subpopulations.
-        M = 0.2
-        d = 3
-        m = M / (2 * (d - 1))
-        # Allocate the initial sample. Because we are interested in the
-        # between-subpopulation coalescence times, we choose one sample each
-        # from the first two subpopulations.
-        population_configurations = [
-            msprime.PopulationConfiguration(sample_size=1),
-            msprime.PopulationConfiguration(sample_size=1),
-            msprime.PopulationConfiguration(sample_size=0)]
-        # Now we set up the migration matrix. Since this is a symmetric
-        # island model, we have the same rate of migration between all
-        # pairs of subpopulations. Diagonal elements must be zero.
-        migration_matrix = [
-            [0, m, m],
-            [m, 0, m],
-            [m, m, 0]]
-        # We pass these values to the simulate function, and ask it
-        # to run the required number of replicates.
-        replicates = msprime.simulate(Ne=0.5,
-            population_configurations=population_configurations,
-            migration_matrix=migration_matrix,
-            num_replicates=num_replicates)
-        # And then iterate over these replicates
-        T = np.zeros(num_replicates)
-        for i, tree_sequence in enumerate(replicates):
-            tree = tree_sequence.first()
-            T[i] = tree.time(tree.root) / 4
-        # Finally, calculate the analytical expectation and print
-        # out the results
-        analytical = d / 4 + (d - 1) / (4 * M)
-        print("Observed  =", np.mean(T))
-        print("Predicted =", analytical)
+.. literalinclude:: examples/migration.py
 
 Again, we set :math:`N_e = 0.5` to agree with convention in theoretical results,
 where usually one coalescent time unit is, in generations, the effective number of *haploid* individuals.
@@ -2096,178 +2191,3 @@ Running this example we get:
     # Observed  = 3.254904176088153
     # Predicted = 3.25
 
-
-Old stuff
-*********
-
-.. note::
-
-    Leftover from previous tutorial. Let's figure out where it goes best.
-
-``msprime`` provides a flexible and simple way to model past demographic events
-in arbitrary combinations. Here is an example describing the
-`Gutenkunst et al. <http://dx.doi.org/10.1371/journal.pgen.1000695>`_
-out-of-Africa model.
-`Figure 2B <http://dx.doi.org/10.1371/journal.pgen.1000695.g002>`_
-of that paper provides a schematic, with the values below taken from
-`Table 1 <http://dx.doi.org/10.1371/journal.pgen.1000695.t001>`_.
-Note that the code reproduced below is provided by way of illustration:
-to use this exact model for your own purposes, we recommend that you try the
-:ref:`version <stdpopsim:sec_catalog_homsap_models_outofafrica_3g09>`
-that is :ref:`catalogued <stdpopsim:sec_catalog>` in the
-:ref:`stdpopsim project <stdpopsim:sec_introduction>` of standard simulation models.
-
-Coalescent simulation moves from the present back into the past,
-so times are in units of generations *ago*, and we build the model
-with most recent events first.
-
-
-.. image:: _static/Gutenkunst_OOA_diagram.svg
-   :width: 500px
-   :align: center
-   :alt: Schematic of Gutenkunst et al. (2009) out-of-Africa model.
-
-.. note::
-
-    A previous version of this model in the tutorial mistakenly allowed for migration to continue beyond the merger of the African and Eurasian bottleneck populations. This has now been fixed, but if you had copied this model from the tutorial for your own analyses, we suggest you update that model or use the implementation that has been verified in :ref:`stdpopsim project <stdpopsim:sec_introduction>`.
-
-.. code-block:: python
-
-    import math
-    import msprime
-    def out_of_africa():
-        # First we set out the maximum likelihood values of the various parameters
-        # given in Table 1.
-        N_A = 7300
-        N_AF = 12300
-        N_B = 2100
-        N_EU0 = 1000
-        N_AS0 = 510
-        r_EU = 0.004   # 0.4% EU growth
-        r_AS = 0.0055  # 0.55% AS growth
-        # Migration rates during the various epochs.
-        m_AF_B = 25e-5
-        m_AF_EU = 3e-5
-        m_AF_AS = 1.9e-5
-        m_EU_AS = 9.6e-5
-        # Times in Table 1 are provided in years, calculated on the assumption
-        # of 25 years per generation: we need to convert back into generations.
-        generation_time = 25
-        T_AF = 220e3 / generation_time
-        T_B = 140e3 / generation_time
-        T_EU_AS = 21.2e3 / generation_time
-        # We need to work out the starting (diploid) population sizes based on
-        # the growth rates provided for these two populations
-        N_EU = N_EU0 / math.exp(-r_EU * T_EU_AS)
-        N_AS = N_AS0 / math.exp(-r_AS * T_EU_AS)
-        # Population IDs correspond to their indexes in the population
-        # configuration array. Therefore, we have 0=YRI, 1=CEU and 2=CHB
-        # initially.
-        population_configurations = [
-            msprime.PopulationConfiguration(
-                sample_size=0, initial_size=N_AF),
-            msprime.PopulationConfiguration(
-                sample_size=1, initial_size=N_EU, growth_rate=r_EU),
-            msprime.PopulationConfiguration(
-                sample_size=1, initial_size=N_AS, growth_rate=r_AS)
-        ]
-        migration_matrix = [
-            [      0, m_AF_EU, m_AF_AS],
-            [m_AF_EU,       0, m_EU_AS],
-            [m_AF_AS, m_EU_AS,       0],
-        ]
-        demographic_events = [
-            # CEU and CHB merge into B with rate changes at T_EU_AS
-            msprime.MassMigration(
-                time=T_EU_AS, source=2, destination=1, proportion=1.0),
-            msprime.MigrationRateChange(time=T_EU_AS, rate=0),
-            msprime.MigrationRateChange(
-                time=T_EU_AS, rate=m_AF_B, matrix_index=(0, 1)),
-            msprime.MigrationRateChange(
-                time=T_EU_AS, rate=m_AF_B, matrix_index=(1, 0)),
-            msprime.PopulationParametersChange(
-                time=T_EU_AS, initial_size=N_B, growth_rate=0, population_id=1),
-            # Population B merges into YRI at T_B
-            msprime.MassMigration(
-                time=T_B, source=1, destination=0, proportion=1.0),
-            msprime.MigrationRateChange(time=T_B, rate=0),
-            # Size changes to N_A at T_AF
-            msprime.PopulationParametersChange(
-                time=T_AF, initial_size=N_A, population_id=0)
-        ]
-        return {
-            'population_configurations':population_configurations,
-            'migration_matrix':migration_matrix,
-            'demographic_events':demographic_events}
-
-The :class:`.DemographyDebugger` provides a method to debug the history that you have described so that you can be sure that the migration rates, population sizes and growth rates are all as you intend during each epoch:
-
-.. code-block:: python
-
-    # Use the demography debugger to print out the demographic history
-    # that we have just described.
-    dd = msprime.DemographyDebugger(**out_of_africa())
-    dd.print_history()
-
-    # =============================
-    # Epoch: 0 -- 848.0 generations
-    # =============================
-    #      start     end      growth_rate |     0        1        2
-    #    -------- --------       -------- | -------- -------- --------
-    # 0 |1.23e+04 1.23e+04              0 |     0      3e-05   1.9e-05
-    # 1 |2.97e+04   1e+03           0.004 |   3e-05      0     9.6e-05
-    # 2 |5.41e+04    510           0.0055 |  1.9e-05  9.6e-05     0
-    #
-    # Events @ generation 848.0
-    #    - Mass migration: Lineages moved with probability 1.0 backwards in time with source 2 & dest 1
-    #                      (equivalent to migration from 1 to 2 forwards in time)
-    #    - Migration rate change to 0 everywhere
-    #    - Migration rate change for (0, 1) to 0.00025
-    #    - Migration rate change for (1, 0) to 0.00025
-    #    - Population parameter change for 1: initial_size -> 2100 growth_rate -> 0
-    # ==================================
-    # Epoch: 848.0 -- 5600.0 generations
-    # ==================================
-    #      start     end      growth_rate |     0        1        2
-    #    -------- --------       -------- | -------- -------- --------
-    # 0 |1.23e+04 1.23e+04              0 |     0     0.00025     0
-    # 1 | 2.1e+03  2.1e+03              0 |  0.00025     0        0
-    # 2 |   510   2.27e-09         0.0055 |     0        0        0
-    #
-    # Events @ generation 5600.0
-    #    - Mass migration: Lineages moved with probability 1.0 backwards in time with source 1 & dest 0
-                         (equivalent to migration from 0 to 1 forwards in time)
-    #    - Migration rate change to 0 everywhere
-    # ===================================
-    # Epoch: 5600.0 -- 8800.0 generations
-    # ===================================
-    #      start     end      growth_rate |     0        1        2
-    #    -------- --------       -------- | -------- -------- --------
-    # 0 |1.23e+04 1.23e+04              0 |     0        0        0
-    # 1 | 2.1e+03  2.1e+03              0 |     0        0        0
-    # 2 |2.27e-09 5.17e-17         0.0055 |     0        0        0
-    #
-    # Events @ generation 8800.0
-    #    - Population parameter change for 0: initial_size -> 7300
-    # ================================
-    # Epoch: 8800.0 -- inf generations
-    # ================================
-    #      start     end      growth_rate |     0        1        2
-    #    -------- --------       -------- | -------- -------- --------
-    # 0 | 7.3e+03  7.3e+03              0 |     0        0        0
-    # 1 | 2.1e+03  2.1e+03              0 |     0        0        0
-    # 2 |5.17e-17     0            0.0055 |     0        0        0
-
-.. warning:: The output of the :meth:`.DemographyDebugger.print_history` method
-    is intended only for debugging purposes, and is not meant to be machine
-    readable. The format is also preliminary; if there is other information
-    that you think would be useful, please `open an issue on GitHub
-    <https://github.com/tskit-dev/msprime/issues>`_
-
-Once you are satisfied that the demographic history that you have built
-is correct, it can then be simulated by calling the :func:`.simulate`
-function:
-
-.. code-block:: python
-
-    ts = msprime.simulate(**out_of_africa())

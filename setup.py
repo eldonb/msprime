@@ -93,16 +93,15 @@ msp_source_files = [
     "avl.c",
     "util.c",
     "object_heap.c",
-    "recomb_map.c",
+    "rate_map.c",
     "mutgen.c",
     "likelihood.c",
-    "interval_map.c",
 ]
 tsk_source_files = ["core.c", "tables.c", "trees.c"]
 kas_source_files = ["kastore.c"]
 
 sources = (
-    ["_msprimemodule.c"]
+    ["msprime/_msprimemodule.c"]
     + [os.path.join(libdir, f) for f in msp_source_files]
     + [os.path.join(tskdir, f) for f in tsk_source_files]
     + [os.path.join(kasdir, f) for f in kas_source_files]
@@ -121,7 +120,7 @@ if IS_WINDOWS:
     ]
 
 _msprime_module = Extension(
-    "_msprime",
+    "msprime._msprime",
     sources=sources,
     # Enable asserts by default.
     undef_macros=["NDEBUG"],
@@ -150,7 +149,7 @@ setup(
     },
     include_package_data=True,
     # NOTE: make sure this is the 'attrs' package, not 'attr'!
-    install_requires=[numpy_ver, "attrs>=19.1.0", "newick", "tskit"],
+    install_requires=[numpy_ver, "attrs>=19.1.0", "newick", "tskit>=0.3"],
     ext_modules=[_msprime_module],
     keywords=["Coalescent simulation", "ms"],
     license="GNU GPLv3+",

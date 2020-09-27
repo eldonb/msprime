@@ -68,32 +68,123 @@ fatal_msprime_error(int err, int line)
     exit(EXIT_FAILURE);
 }
 
-static void
-load_tables(tsk_table_collection_t *tables, const char *filename)
+static bool
+read_pedigree(tsk_table_collection_t *tables, config_t *config)
 {
     int ret = 0;
-    tsk_table_collection_t tmp;
+    size_t i, j, k, size, num_inds;
+    tsk_flags_t flags;
+    tsk_id_t ind_id;
+    size_t ploidy = 2;
+    tsk_id_t *parents = NULL;
+    double *time = NULL;
+    tsk_flags_t *is_sample = NULL;
+    config_setting_t *s, *row;
+    config_setting_t *setting;
 
-    /* We need to allocate a temporary table here because tbl_collection_load
-     * loads a read-only version of the tables. */
-    ret = tsk_table_collection_load(&tmp, filename, 0);
-    if (ret != 0) {
-        fatal_tskit_error(ret, __LINE__);
+    setting = config_lookup(config, "time");
+    if (config_setting_is_array(setting) == CONFIG_FALSE) {
+        fatal_error("Pedigree times must be an array");
     }
-    ret = tsk_table_collection_copy(&tmp, tables, 0);
-    if (ret != 0) {
-        fatal_tskit_error(ret, __LINE__);
+    size = (size_t) config_setting_length(setting);
+    num_inds = size;
+
+    if (num_inds == 0) {
+        /* If we have zero individuals, skip the rest of this method. */
+        return false;
     }
-    tsk_table_collection_free(&tmp);
+
+    parents = malloc(num_inds * ploidy * sizeof(tsk_id_t));
+    time = malloc(num_inds * sizeof(double));
+    is_sample = malloc(num_inds * sizeof(tsk_flags_t));
+    if (parents == NULL || time == NULL || is_sample == NULL) {
+        fatal_error("Out of memory");
+    }
+
+    setting = config_lookup(config, "parents");
+    if (config_setting_is_list(setting) == CONFIG_FALSE) {
+        fatal_error("Pedigree parents must be an list");
+    }
+    for (j = 0; j < num_inds; j++) {
+        row = config_setting_get_elem(setting, (unsigned int) j);
+        if (row == NULL) {
+            fatal_error("error reading pedigree parents %d", j);
+        }
+        if (config_setting_is_array(row) == CONFIG_FALSE) {
+            fatal_error("pedigree parents row %d not an array", j);
+        }
+        if (config_setting_length(row) != ploidy) {
+            fatal_error("pedigree parents must have 'ploidy' columns");
+        }
+        for (i = 0; i < ploidy; i++) {
+            s = config_setting_get_elem(row, (unsigned int) i);
+            if (!config_setting_is_number(s)) {
+                fatal_error("pedigree parent entries must be numbers");
+            }
+            parents[j * ploidy + i] = (tsk_id_t) config_setting_get_int(s);
+        }
+    }
+
+    setting = config_lookup(config, "time");
+    if (config_setting_is_array(setting) == CONFIG_FALSE) {
+        fatal_error("Pedigree times must be an array");
+    }
+    for (j = 0; j < num_inds; j++) {
+        s = config_setting_get_elem(setting, (unsigned int) j);
+        if (s == NULL) {
+            fatal_error("error reading pedigree individual %d", j);
+        }
+        time[j] = (double) config_setting_get_float(s);
+    }
+
+    setting = config_lookup(config, "is_sample");
+    if (config_setting_is_array(setting) == CONFIG_FALSE) {
+        fatal_error("Pedigree sample flags must be an array");
+    }
+    for (j = 0; j < num_inds; j++) {
+        s = config_setting_get_elem(setting, (unsigned int) j);
+        if (s == NULL) {
+            fatal_error("error reading pedigree individual %d", j);
+        }
+        is_sample[j] = (tsk_flags_t) config_setting_get_int(s);
+        assert(is_sample[j] == 0 || is_sample[j] == 1);
+    }
+
+    /* Update the tables to store this information */
+    for (j = 0; j < num_inds; j++) {
+        ret = tsk_individual_table_add_row(&tables->individuals, 0, NULL, 0,
+            /* encode the parents in the metadata */
+            (void *) (parents + j * ploidy), ploidy * sizeof(tsk_id_t));
+        if (ret < 0) {
+            fatal_tskit_error(ret, __LINE__);
+        }
+        ind_id = ret;
+        for (k = 0; k < ploidy; k++) {
+            flags = is_sample[j] ? TSK_NODE_IS_SAMPLE : 0;
+            ret = tsk_node_table_add_row(
+                &tables->nodes, flags, time[j], 0, ind_id, NULL, 0);
+            if (ret < 0) {
+                fatal_tskit_error(ret, __LINE__);
+            }
+        }
+    }
+
+    free(parents);
+    free(time);
+    free(is_sample);
+    return true;
 }
-
 static void
-read_samples(config_t *config, size_t *num_samples, sample_t **samples)
+read_initial_tables(config_t *config, tsk_table_collection_t *tables)
 {
-    size_t j, n;
-    sample_t *ret_samples = NULL;
+    int ret;
+    size_t j, n, num_populations;
+    double time;
+    tsk_id_t population;
+    tsk_flags_t flags = TSK_NODE_IS_SAMPLE;
     config_setting_t *s, *t;
     config_setting_t *setting = config_lookup(config, "samples");
+    bool pedigree_specified;
 
     if (setting == NULL) {
         fatal_error("samples is a required parameter");
@@ -101,10 +192,11 @@ read_samples(config_t *config, size_t *num_samples, sample_t **samples)
     if (config_setting_is_list(setting) == CONFIG_FALSE) {
         fatal_error("samples must be a list");
     }
+    pedigree_specified = read_pedigree(tables, config);
+
     n = (size_t) config_setting_length(setting);
-    ret_samples = malloc(n * sizeof(sample_t));
-    if (ret_samples == NULL) {
-        fatal_error("Out of memory");
+    if (pedigree_specified && n > 0) {
+        fatal_error("Cannot specify samples and pedigree");
     }
     for (j = 0; j < n; j++) {
         s = config_setting_get_elem(setting, (unsigned int) j);
@@ -118,20 +210,37 @@ read_samples(config_t *config, size_t *num_samples, sample_t **samples)
         if (t == NULL) {
             fatal_error("population not specified");
         }
-        ret_samples[j].population_id = (population_id_t) config_setting_get_int(t);
+        population = (population_id_t) config_setting_get_int(t);
         t = config_setting_get_member(s, "time");
         if (t == NULL) {
             fatal_error("population not specified");
         }
-        ret_samples[j].time = config_setting_get_float(t);
+        time = config_setting_get_float(t);
+        ret = tsk_node_table_add_row(
+            &tables->nodes, flags, time, population, TSK_NULL, NULL, 0);
+        if (ret < 0) {
+            fatal_tskit_error(ret, __LINE__);
+        }
     }
-    *samples = ret_samples;
-    *num_samples = n;
+    setting = config_lookup(config, "population_configuration");
+    if (setting == NULL) {
+        fatal_error("population_configuration is a required parameter");
+    }
+    if (config_setting_is_list(setting) == CONFIG_FALSE) {
+        fatal_error("population_configuration must be a list");
+    }
+    num_populations = config_setting_length(setting);
+
+    for (j = 0; j < num_populations; j++) {
+        ret = tsk_population_table_add_row(&tables->populations, NULL, 0);
+        if (ret < 0) {
+            fatal_tskit_error(ret, __LINE__);
+        }
+    }
 }
 
 static void
-read_sweep_genic_selection_model_config(msp_t *msp, config_setting_t *model_setting,
-        double population_size)
+read_sweep_genic_selection_model_config(msp_t *msp, config_setting_t *model_setting)
 {
     int ret = 0;
     config_setting_t *s;
@@ -167,8 +276,8 @@ read_sweep_genic_selection_model_config(msp_t *msp, config_setting_t *model_sett
     }
     alpha = config_setting_get_float(s);
 
-    ret = msp_set_simulation_model_sweep_genic_selection(msp, population_size,
-            position, start_frequency, end_frequency, alpha, dt);
+    ret = msp_set_simulation_model_sweep_genic_selection(
+        msp, position, start_frequency, end_frequency, alpha, dt);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
@@ -181,7 +290,7 @@ read_model_config(msp_t *msp, config_t *config)
     config_setting_t *setting = config_lookup(config, "model");
     config_setting_t *s;
     const char *name;
-    double population_size, psi, c, alpha, truncation_point;
+    double psi, c, alpha, truncation_point;
 
     if (setting == NULL) {
         fatal_error("model is a required parameter");
@@ -195,20 +304,17 @@ read_model_config(msp_t *msp, config_t *config)
     }
     name = config_setting_get_string(s);
 
-    s = config_setting_get_member(setting, "population_size");
-    if (s == NULL) {
-        fatal_error("population_size not specified");
-    }
-    population_size = config_setting_get_float(s);
     /* printf("Checking model specification\n"); */
     if (strcmp(name, "hudson") == 0) {
-        ret = msp_set_simulation_model_hudson(msp, population_size);
+        ret = msp_set_simulation_model_hudson(msp);
     } else if (strcmp(name, "smc") == 0) {
-        ret = msp_set_simulation_model_smc(msp, population_size);
+        ret = msp_set_simulation_model_smc(msp);
     } else if (strcmp(name, "smc_prime") == 0) {
-        ret = msp_set_simulation_model_smc_prime(msp, population_size);
+        ret = msp_set_simulation_model_smc_prime(msp);
     } else if (strcmp(name, "dtwf") == 0) {
-        ret = msp_set_simulation_model_dtwf(msp, population_size);
+        ret = msp_set_simulation_model_dtwf(msp);
+    } else if (strcmp(name, "wf_ped") == 0) {
+        ret = msp_set_simulation_model_wf_ped(msp);
     } else if (strcmp(name, "dirac") == 0) {
         s = config_setting_get_member(setting, "psi");
         if (s == NULL) {
@@ -220,7 +326,7 @@ read_model_config(msp_t *msp, config_t *config)
             fatal_error("dirac model c not specified");
         }
         c = config_setting_get_float(s);
-        ret = msp_set_simulation_model_dirac(msp, population_size, psi, c);
+        ret = msp_set_simulation_model_dirac(msp, psi, c);
     } else if (strcmp(name, "beta") == 0) {
         s = config_setting_get_member(setting, "alpha");
         if (s == NULL) {
@@ -232,9 +338,9 @@ read_model_config(msp_t *msp, config_t *config)
             fatal_error("beta model truncation_point not specified");
         }
         truncation_point = config_setting_get_float(s);
-        ret = msp_set_simulation_model_beta(msp, population_size, alpha, truncation_point);
+        ret = msp_set_simulation_model_beta(msp, alpha, truncation_point);
     } else if (strcmp(name, "sweep_genic_selection") == 0) {
-        read_sweep_genic_selection_model_config(msp, setting, population_size);
+        read_sweep_genic_selection_model_config(msp, setting);
     } else {
         fatal_error("Unknown simulation model '%s'", name);
     }
@@ -263,7 +369,7 @@ read_population_configuration(msp_t *msp, config_t *config)
     if (config_lookup_int(config, "num_labels", &num_labels) == CONFIG_FALSE) {
         fatal_error("num_labels is a required parameter");
     }
-    ret = msp_set_dimensions(msp, (size_t) num_populations, (size_t) num_labels);
+    ret = msp_set_num_labels(msp, num_labels);
     if (ret != 0) {
         fatal_error("Error reading number of populations");
     }
@@ -285,8 +391,7 @@ read_population_configuration(msp_t *msp, config_t *config)
             fatal_error("initial_size not specified");
         }
         initial_size = config_setting_get_float(t);
-        ret = msp_set_population_configuration(msp, j, initial_size,
-                growth_rate);
+        ret = msp_set_population_configuration(msp, j, initial_size, growth_rate);
         if (ret != 0) {
             fatal_msprime_error(ret, __LINE__);
         }
@@ -299,8 +404,8 @@ read_demographic_events(msp_t *msp, config_t *config)
     int ret = 0;
     int j;
     const char *type;
-    double time, growth_rate, initial_size, migration_rate, proportion,
-           intensity, strength;
+    double time, growth_rate, initial_size, migration_rate, proportion, intensity,
+        strength;
     int num_demographic_events, population_id, source, dest;
     config_setting_t *s, *t;
     config_setting_t *setting = config_lookup(config, "demographic_events");
@@ -349,8 +454,8 @@ read_demographic_events(msp_t *msp, config_t *config)
                 fatal_error("population_id not specified");
             }
             population_id = config_setting_get_int(t);
-            ret = msp_add_population_parameters_change(msp, time,
-                    population_id, initial_size, growth_rate);
+            ret = msp_add_population_parameters_change(
+                msp, time, population_id, initial_size, growth_rate);
         } else if (strcmp(type, "migration_rate_change") == 0) {
             t = config_setting_get_member(s, "migration_rate");
             if (t == NULL) {
@@ -367,8 +472,7 @@ read_demographic_events(msp_t *msp, config_t *config)
                 fatal_error("dest not specified");
             }
             dest = config_setting_get_int(t);
-            ret = msp_add_migration_rate_change(msp, time,
-                    source, dest, migration_rate);
+            ret = msp_add_migration_rate_change(msp, time, source, dest, migration_rate);
         } else if (strcmp(type, "mass_migration") == 0) {
             t = config_setting_get_member(s, "proportion");
             if (t == NULL) {
@@ -409,8 +513,7 @@ read_demographic_events(msp_t *msp, config_t *config)
                 fatal_error("population_id not specified");
             }
             population_id = config_setting_get_int(t);
-            ret = msp_add_instantaneous_bottleneck(msp, time, population_id,
-                    strength);
+            ret = msp_add_instantaneous_bottleneck(msp, time, population_id, strength);
         } else {
             fatal_error("unknown demographic event type '%s'", type);
         }
@@ -455,114 +558,7 @@ read_migration_matrix(msp_t *msp, config_t *config)
 }
 
 static void
-read_pedigree(msp_t *msp, config_t *config)
-{
-    int ret = 0;
-    size_t i, j, size, num_inds, num_samples;
-    size_t ploidy = 2;
-    tsk_id_t *inds = NULL;
-    tsk_id_t *parents = NULL;
-    double *time = NULL;
-    tsk_flags_t *is_sample = NULL;
-    config_setting_t *s, *row;
-    config_setting_t *setting;
-
-    // Read individual array
-    setting = config_lookup(config, "individual");
-    if (config_setting_is_array(setting) == CONFIG_FALSE) {
-        fatal_error("Pedigree individuals must be an array");
-    }
-    size = (size_t) config_setting_length(setting);
-    num_inds = size;
-
-    inds = malloc(num_inds * sizeof(tsk_id_t));
-    parents = malloc(num_inds * ploidy * sizeof(tsk_id_t));
-    time = malloc(num_inds * sizeof(double));
-    is_sample = malloc(num_inds * sizeof(tsk_flags_t));
-    if (inds == NULL || parents == NULL || time == NULL ||
-            is_sample == NULL) {
-        fatal_error("Out of memory");
-    }
-
-    // Set individual array
-    for (j = 0; j < num_inds; j++) {
-        s = config_setting_get_elem(setting, (unsigned int) j);
-        if (s == NULL) {
-            fatal_error("error reading pedigree individual %d", j);
-        }
-        inds[j] = (tsk_id_t) config_setting_get_int(s);
-    }
-
-    // Read remaining pedigree arrays
-    setting = config_lookup(config, "parents");
-    if (config_setting_is_list(setting) == CONFIG_FALSE) {
-        fatal_error("Pedigree parents must be an list");
-    }
-    for (j = 0; j < num_inds; j++) {
-        row = config_setting_get_elem(setting, (unsigned int) j);
-        if (row == NULL) {
-            fatal_error("error reading pedigree parents %d", j);
-        }
-        if (config_setting_is_array(row) == CONFIG_FALSE) {
-            fatal_error("pedigree parents row %d not an array", j);
-        }
-        if (config_setting_length(row) != ploidy) {
-            fatal_error(
-                "pedigree parents must have 'ploidy' columns");
-        }
-        for (i = 0; i < ploidy; i++) {
-            s = config_setting_get_elem(row, (unsigned int) i);
-            if (!config_setting_is_number(s)) {
-                fatal_error("pedigree parent entries must be numbers");
-            }
-            parents[j * ploidy + i] = (tsk_id_t) config_setting_get_int(s);
-        }
-    }
-
-    setting = config_lookup(config, "time");
-    if (config_setting_is_array(setting) == CONFIG_FALSE) {
-        fatal_error("Pedigree times must be an array");
-    }
-    for (j = 0; j < num_inds; j++) {
-        s = config_setting_get_elem(setting, (unsigned int) j);
-        if (s == NULL) {
-            fatal_error("error reading pedigree individual %d", j);
-        }
-        time[j] = (double) config_setting_get_float(s);
-    }
-
-    setting = config_lookup(config, "is_sample");
-    if (config_setting_is_array(setting) == CONFIG_FALSE) {
-        fatal_error("Pedigree sample flags must be an array");
-    }
-    num_samples = 0;
-    for (j = 0; j < num_inds; j++) {
-        s = config_setting_get_elem(setting, (unsigned int) j);
-        if (s == NULL) {
-            fatal_error("error reading pedigree individual %d", j);
-        }
-        is_sample[j] = (tsk_flags_t) config_setting_get_int(s);
-        assert(is_sample[j] == 0 || is_sample[j] == 1);
-        num_samples += is_sample[j];
-    }
-    assert(num_samples > 0);
-
-    ret = msp_alloc_pedigree(msp, num_inds, ploidy);
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
-    ret = msp_set_pedigree(msp, num_inds, inds, parents, time, is_sample);
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
-    free(inds);
-    free(parents);
-    free(time);
-    free(is_sample);
-}
-
-static void
-read_recomb_map(uint32_t num_loci, recomb_map_t *recomb_map, config_t *config)
+read_recomb_map(rate_map_t *recomb_map, config_t *config)
 {
     int ret = 0;
     size_t j, size;
@@ -592,8 +588,7 @@ read_recomb_map(uint32_t num_loci, recomb_map_t *recomb_map, config_t *config)
             fatal_error("recombination_map[%d] not an array", j);
         }
         if (config_setting_length(row) != 2) {
-            fatal_error(
-                "recombination_map entries must be [coord, rate] pairs");
+            fatal_error("recombination_map entries must be [coord, rate] pairs");
         }
         s = config_setting_get_elem(row, 0);
         if (!config_setting_is_number(s)) {
@@ -606,8 +601,7 @@ read_recomb_map(uint32_t num_loci, recomb_map_t *recomb_map, config_t *config)
         }
         rates[j] = config_setting_get_float(s);
     }
-    // TODO Read discrete flag from recombination map
-    ret = recomb_map_alloc(recomb_map, size, coordinates, rates, true);
+    ret = rate_map_alloc(recomb_map, size - 1, coordinates, rates);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
@@ -617,17 +611,13 @@ read_recomb_map(uint32_t num_loci, recomb_map_t *recomb_map, config_t *config)
 
 static void
 get_configuration(gsl_rng *rng, msp_t *msp, tsk_table_collection_t *tables,
-        mutation_params_t *mutation_params, recomb_map_t *recomb_map,
-        const char *filename)
+    mutation_params_t *mutation_params, rate_map_t *recomb_map, const char *filename)
 {
     int ret = 0;
     int err;
     int int_tmp;
-    uint32_t num_loci;
-    double gene_conversion_rate, gene_conversion_track_length;
-    size_t num_samples;
+    double start_time, gene_conversion_rate, gene_conversion_track_length;
     const char *from_ts_path;
-    sample_t *samples = NULL;
     config_t *config = malloc(sizeof(config_t));
     config_setting_t *t;
 
@@ -638,70 +628,75 @@ get_configuration(gsl_rng *rng, msp_t *msp, tsk_table_collection_t *tables,
     err = config_read_file(config, filename);
     if (err == CONFIG_FALSE) {
         fatal_error("configuration error:%s at line %d in file %s\n",
-                config_error_text(config), config_error_line(config),
-                filename);
+            config_error_text(config), config_error_line(config), filename);
     }
     if (config_lookup_int(config, "random_seed", &int_tmp) == CONFIG_FALSE) {
         fatal_error("random_seed is a required parameter");
     }
-    gsl_rng_set(rng,  (unsigned long) int_tmp);
-    read_samples(config, &num_samples, &samples);
+    gsl_rng_set(rng, (unsigned long) int_tmp);
     if (config_lookup_string(config, "from", &from_ts_path) == CONFIG_TRUE) {
-        load_tables(tables, from_ts_path);
+        err = tsk_table_collection_load(tables, from_ts_path, TSK_NO_INIT);
+        if (err != 0) {
+            fatal_tskit_error(err, __LINE__);
+        }
+    } else {
+        read_initial_tables(config, tables);
     }
 
-    if (config_lookup_int(config, "num_loci", &int_tmp) == CONFIG_FALSE) {
-        fatal_error("num_loci is a required parameter");
-    }
-    num_loci = (uint32_t) int_tmp;
-    read_recomb_map(num_loci, recomb_map, config);
+    read_recomb_map(recomb_map, config);
 
-    ret = msp_alloc(msp, num_samples, samples, recomb_map, tables, rng);
+    tables->sequence_length = rate_map_get_sequence_length(recomb_map);
+
+    ret = msp_alloc(msp, tables, rng);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
+    ret = msp_set_recombination_map(
+        msp, recomb_map->size, recomb_map->position, recomb_map->rate);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
+
     if (config_lookup_float(config, "gene_conversion_rate", &gene_conversion_rate)
-            == CONFIG_FALSE) {
+        == CONFIG_FALSE) {
         fatal_error("gene_conversion_rate is a required parameter");
     }
-    if (config_lookup_float(config, "gene_conversion_track_length",
-                &gene_conversion_track_length)
-            == CONFIG_FALSE) {
+    if (config_lookup_float(
+            config, "gene_conversion_track_length", &gene_conversion_track_length)
+        == CONFIG_FALSE) {
         fatal_error("gene_conversion_track_length is a required parameter");
     }
-    ret = msp_set_gene_conversion_rate(msp, gene_conversion_rate,
-            gene_conversion_track_length);
+    ret = msp_set_gene_conversion_rate(msp, gene_conversion_rate);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
-    if (config_lookup_float(config,
-            "mutation_rate", &mutation_params->mutation_rate)
-            == CONFIG_FALSE) {
+    ret = msp_set_gene_conversion_track_length(msp, gene_conversion_track_length);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
+    if (config_lookup_float(config, "mutation_rate", &mutation_params->mutation_rate)
+        == CONFIG_FALSE) {
         fatal_error("mutation_rate is a required parameter");
     }
-    if (config_lookup_int(config, "mutation_alphabet", &int_tmp)
-            == CONFIG_FALSE) {
+    if (config_lookup_int(config, "mutation_alphabet", &int_tmp) == CONFIG_FALSE) {
         fatal_error("mutation_alphabet is a required parameter.");
     }
     mutation_params->alphabet = int_tmp;
-    if (config_lookup_int(config, "avl_node_block_size", &int_tmp)
-            == CONFIG_FALSE) {
+    if (config_lookup_int(config, "avl_node_block_size", &int_tmp) == CONFIG_FALSE) {
         fatal_error("avl_node_block_size is a required parameter");
     }
     ret = msp_set_avl_node_block_size(msp, (size_t) int_tmp);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
-    if (config_lookup_int(config, "segment_block_size", &int_tmp)
-            == CONFIG_FALSE) {
+    if (config_lookup_int(config, "segment_block_size", &int_tmp) == CONFIG_FALSE) {
         fatal_error("segment_block_size is a required parameter");
     }
     ret = msp_set_segment_block_size(msp, (size_t) int_tmp);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
-    if (config_lookup_int(config, "node_mapping_block_size", &int_tmp)
-            == CONFIG_FALSE) {
+    if (config_lookup_int(config, "node_mapping_block_size", &int_tmp) == CONFIG_FALSE) {
         fatal_error("node_mapping_block_size is a required parameter");
     }
     ret = msp_set_node_mapping_block_size(msp, (size_t) int_tmp);
@@ -718,6 +713,13 @@ get_configuration(gsl_rng *rng, msp_t *msp, tsk_table_collection_t *tables,
     if (config_lookup_int(config, "store_full_arg", &int_tmp) == CONFIG_FALSE) {
         fatal_error("store_ful_arg is a required parameter");
     }
+    if (config_lookup_float(config, "start_time", &start_time) == CONFIG_FALSE) {
+        fatal_error("start_time is a required parameter");
+    }
+    ret = msp_set_start_time(msp, start_time);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
     ret = msp_set_store_full_arg(msp, (bool) int_tmp);
     if (ret != 0) {
         fatal_error(msp_strerror(ret));
@@ -728,12 +730,10 @@ get_configuration(gsl_rng *rng, msp_t *msp, tsk_table_collection_t *tables,
     }
     read_model_config(msp, config);
     read_population_configuration(msp, config);
-    read_pedigree(msp, config);
     read_migration_matrix(msp, config);
     read_demographic_events(msp, config);
     config_destroy(config);
     free(config);
-    free(samples);
 }
 
 static void
@@ -742,7 +742,7 @@ record_provenance(tsk_provenance_table_t *provenance)
     time_t timer;
     size_t timestamp_size = 64;
     char buffer[timestamp_size];
-    struct tm* tm_info;
+    struct tm *tm_info;
     const char *provenance_str = "{\"program\"=\"main\"}";
     int ret;
 
@@ -750,23 +750,22 @@ record_provenance(tsk_provenance_table_t *provenance)
     tm_info = localtime(&timer);
     strftime(buffer, timestamp_size, "%Y-%m-%dT%H:%M:%S", tm_info);
 
-    ret = tsk_provenance_table_add_row(provenance, buffer, strlen(buffer), provenance_str,
-            strlen(provenance_str));
-    if (ret != 0) {
+    ret = tsk_provenance_table_add_row(
+        provenance, buffer, strlen(buffer), provenance_str, strlen(provenance_str));
+    if (ret < 1) {
         fatal_error("Error recording provenance");
     }
-
 }
 
 static void
-run_simulate(const char *conf_file, const char *output_file, int verbose, int num_replicates)
+run_simulate(
+    const char *conf_file, const char *output_file, int verbose, int num_replicates)
 {
     int ret = -1;
     int j;
     mutation_params_t mutation_params;
     msp_t msp;
-    recomb_map_t recomb_map;
-    interval_map_t mut_map;
+    rate_map_t recomb_map;
     mutation_model_t mut_model;
     mutgen_t mutgen;
     tsk_table_collection_t tables;
@@ -781,28 +780,28 @@ run_simulate(const char *conf_file, const char *output_file, int verbose, int nu
         fatal_tskit_error(ret, __LINE__);
     }
     get_configuration(rng, &msp, &tables, &mutation_params, &recomb_map, conf_file);
-    ret = interval_map_alloc_single(&mut_map,
-            recomb_map_get_sequence_length(&recomb_map), mutation_params.mutation_rate);
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
-    ret = mutation_model_factory(&mut_model, mutation_params.alphabet);
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
-    ret = mutgen_alloc(&mutgen, rng, &mut_map, &mut_model, 0);
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
-    if (ret != 0) {
-        fatal_msprime_error(ret, __LINE__);
-    }
+
     ret = msp_initialise(&msp);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
+
+    ret = matrix_mutation_model_factory(&mut_model, mutation_params.alphabet);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
+    ret = mutgen_alloc(&mutgen, rng, &tables, &mut_model, 0);
+    if (ret != 0) {
+        fatal_msprime_error(ret, __LINE__);
+    }
+    ret = mutgen_set_rate(&mutgen, mutation_params.mutation_rate);
     if (ret != 0) {
         fatal_msprime_error(ret, __LINE__);
     }
     record_provenance(&tables.provenances);
 
+    msp_print_state(&msp, stdout);
+    msp_verify(&msp, MSP_VERIFY_BREAKPOINTS);
     for (j = 0; j < num_replicates; j++) {
         if (verbose >= 1) {
             printf("=====================\n");
@@ -820,9 +819,6 @@ run_simulate(const char *conf_file, const char *output_file, int verbose, int nu
         }
         if (verbose >= 1) {
             msp_print_state(&msp, stdout);
-            if (verbose >= 2 && msp.pedigree != NULL) {
-                msp_print_pedigree_inds(&msp, stdout);
-            }
         }
         msp_verify(&msp, 0);
         ret = msp_finalise_tables(&msp);
@@ -830,7 +826,7 @@ run_simulate(const char *conf_file, const char *output_file, int verbose, int nu
         if (ret != 0) {
             fatal_msprime_error(ret, __LINE__);
         }
-        ret = mutgen_generate(&mutgen, &tables, 0);
+        ret = mutgen_generate(&mutgen, 0);
         if (ret != 0) {
             fatal_msprime_error(ret, __LINE__);
         }
@@ -855,8 +851,7 @@ run_simulate(const char *conf_file, const char *output_file, int verbose, int nu
     }
 
     msp_free(&msp);
-    recomb_map_free(&recomb_map);
-    interval_map_free(&mut_map);
+    rate_map_free(&recomb_map);
     mutation_model_free(&mut_model);
     mutgen_free(&mutgen);
     gsl_rng_free(rng);
@@ -864,18 +859,18 @@ run_simulate(const char *conf_file, const char *output_file, int verbose, int nu
 }
 
 int
-main(int argc, char** argv)
+main(int argc, char **argv)
 {
     /* SYNTAX 1: simulate [-v] <config-file> -o <output-file> */
     struct arg_rex *cmd1 = arg_rex1(NULL, NULL, "simulate", NULL, REG_ICASE, NULL);
     struct arg_lit *verbose1 = arg_lit0("v", "verbose", NULL);
-    struct arg_int *replicates1 = arg_int0("r", "replicates", "<num-replicates>",
-            "number of replicates to run");
+    struct arg_int *replicates1
+        = arg_int0("r", "replicates", "<num-replicates>", "number of replicates to run");
     struct arg_file *infiles1 = arg_file1(NULL, NULL, NULL, NULL);
-    struct arg_file *output1 = arg_file0("o", "output", "output-file",
-            "Output trees file");
+    struct arg_file *output1
+        = arg_file0("o", "output", "output-file", "Output trees file");
     struct arg_end *end1 = arg_end(20);
-    void* argtable1[] = {cmd1, verbose1, infiles1, output1, replicates1, end1};
+    void *argtable1[] = { cmd1, verbose1, infiles1, output1, replicates1, end1 };
     int nerrors1;
 
     int exitcode = EXIT_SUCCESS;
@@ -889,7 +884,7 @@ main(int argc, char** argv)
 
     if (nerrors1 == 0) {
         run_simulate(infiles1->filename[0], output1->filename[0], verbose1->count,
-                replicates1->ival[0]);
+            replicates1->ival[0]);
     } else {
         /* We get here if the command line matched none of the possible syntaxes */
         if (cmd1->count > 0) {
@@ -897,9 +892,11 @@ main(int argc, char** argv)
             printf("usage: %s ", progname);
             arg_print_syntax(stdout, argtable1, "\n");
         } else {
-            /* no correct cmd literals were given, so we cant presume which syntax was intended */
-            printf("%s: missing command.\n",progname);
-            printf("usage 1: %s ", progname);  arg_print_syntax(stdout, argtable1, "\n");
+            /* no correct cmd literals were given, so we cant presume which syntax was
+             * intended */
+            printf("%s: missing command.\n", progname);
+            printf("usage 1: %s ", progname);
+            arg_print_syntax(stdout, argtable1, "\n");
         }
     }
 

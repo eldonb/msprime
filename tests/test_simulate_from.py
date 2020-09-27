@@ -25,10 +25,10 @@ import unittest
 import numpy as np
 import tskit
 
-import _msprime
 import msprime
 import tests.tsutil as tsutil
 import tests.wright_fisher as wf
+from msprime import _msprime
 
 
 def get_wf_base(N, ngens, survival=0.0, num_loci=10, seed=1):
@@ -90,11 +90,10 @@ class TestUncoalescedTreeSequenceProperties(unittest.TestCase):
     def test_discrete_loci(self):
         ts = msprime.simulate(
             10,
-            recombination_map=msprime.RecombinationMap.uniform_map(
-                10, 1, discrete=True
-            ),
+            recombination_map=msprime.RecombinationMap.uniform_map(10, 1),
             random_seed=1,
             end_time=0.5,
+            discrete_genome=True,
         )
         self.verify(ts)
 
@@ -133,7 +132,7 @@ class TestUncoalescedTreeSequenceProperties(unittest.TestCase):
             random_seed=2,
             end_time=100,
             demographic_events=[
-                msprime.SimulationModelChange(10, msprime.StandardCoalescent(1))
+                msprime.SimulationModelChange(10, msprime.StandardCoalescent())
             ],
         )
         self.verify(ts)
@@ -197,7 +196,8 @@ class TestBasicFunctionality(unittest.TestCase):
         final_ts = msprime.simulate(
             from_ts=from_ts,
             random_seed=2,
-            recombination_map=msprime.RecombinationMap.uniform_map(m, 1, discrete=True),
+            recombination_map=msprime.RecombinationMap.uniform_map(m, 1),
+            discrete_genome=True,
         )
         self.verify_from_tables(from_ts, final_ts)
         self.verify_simulation_completed(final_ts)
@@ -208,7 +208,8 @@ class TestBasicFunctionality(unittest.TestCase):
         final_ts = msprime.simulate(
             from_ts=from_ts,
             random_seed=2,
-            recombination_map=msprime.RecombinationMap.uniform_map(m, 1, discrete=True),
+            recombination_map=msprime.RecombinationMap.uniform_map(m, 1),
+            discrete_genome=True,
         )
         self.verify_from_tables(from_ts, final_ts)
         self.verify_simulation_completed(final_ts)
@@ -568,6 +569,14 @@ class TestBasicFunctionality(unittest.TestCase):
             self.verify_from_tables(base_ts, final_ts)
             self.verify_simulation_completed(final_ts)
 
+    def test_start_time_less_than_base_nodes(self):
+        base_ts = msprime.simulate(10, length=10, random_seed=34234, end_time=0.1)
+        self.assertGreater(base_ts.first().num_roots, 1)
+        max_time = max(node.time for node in base_ts.nodes())
+        for x in [-1, 0, max_time / 2, max_time - 1e-6]:
+            final_ts = msprime.simulate(from_ts=base_ts, start_time=x)
+            self.verify_simulation_completed(final_ts)
+
 
 class BaseEquivalanceMixin:
     """
@@ -673,11 +682,11 @@ class BaseEquivalanceMixin:
 
 
 class TestBaseEquivalanceHudson(BaseEquivalanceMixin, unittest.TestCase):
-    model = msprime.StandardCoalescent(1)
+    model = msprime.StandardCoalescent()
 
 
 class TestBaseEquivalanceWrightFisher(BaseEquivalanceMixin, unittest.TestCase):
-    model = msprime.DiscreteTimeWrightFisher(10)
+    model = msprime.DiscreteTimeWrightFisher()
 
 
 class TestDemography(unittest.TestCase):
@@ -825,18 +834,6 @@ class TestErrors(unittest.TestCase):
                     from_ts=base_ts, start_time=100, recombination_map=recomb_map
                 )
 
-    def test_start_time_less_than_zero(self):
-        base_ts = self.get_example_base()
-        with self.assertRaises(ValueError):
-            msprime.simulate(from_ts=base_ts, start_time=-1)
-
-    def test_start_time_less_than_base_nodes(self):
-        base_ts = self.get_example_base()
-        max_time = max(node.time for node in base_ts.nodes())
-        for x in [0, max_time - 1, max_time - 1e-6]:
-            with self.assertRaises(_msprime.InputError):
-                msprime.simulate(from_ts=base_ts, start_time=x)
-
     def test_all_population_ids_null(self):
         base_ts = self.get_example_base()
         tables = base_ts.dump_tables()
@@ -860,10 +857,10 @@ class TestErrors(unittest.TestCase):
 
     def test_single_population_id_null(self):
         base_ts = self.get_example_base()
+        roots = base_ts.first().roots
         tables = base_ts.dump_tables()
         nodes = tables.nodes
-
-        for j in range(base_ts.num_nodes):
+        for j in roots:
             population = np.zeros_like(nodes.population)
             population[j] = -1
             nodes.set_columns(flags=nodes.flags, population=population, time=nodes.time)
@@ -894,24 +891,6 @@ class TestErrors(unittest.TestCase):
             with self.assertRaises(ValueError):
                 msprime.simulate(from_ts=base_ts, start_time=start_time)
 
-    def test_malformed_tree_sequence(self):
-        tables = tskit.TableCollection(1)
-        tables.populations.add_row()
-        tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=0)
-        tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=0)
-        tables.nodes.add_row(flags=0, time=1, population=0)
-        tables.nodes.add_row(flags=0, time=2, population=0)
-        tables.edges.add_row(0, 1, 2, 0)
-        tables.edges.add_row(0, 1, 3, 0)
-        # The exception here is raised by tskit.
-        ts = tables.tree_sequence()
-        with self.assertRaises(tskit.LibraryError) as e:
-            ts.first()
-        message = str(e.exception)
-        with self.assertRaises(_msprime.InputError) as e:
-            msprime.simulate(from_ts=ts)
-        self.assertTrue(str(e.exception).endswith(message))
-
 
 class TestSlimOutput(unittest.TestCase):
     """
@@ -927,8 +906,9 @@ class TestSlimOutput(unittest.TestCase):
             start_time=1,
             population_configurations=population_configurations,
             recombination_map=msprime.RecombinationMap.uniform_map(
-                from_ts.sequence_length, recombination_rate, discrete=True
+                from_ts.sequence_length, recombination_rate,
             ),
+            discrete_genome=True,
             random_seed=seed,
         )
 

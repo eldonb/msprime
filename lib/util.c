@@ -87,8 +87,8 @@ msp_strerror_internal(int err)
         case MSP_ERR_SOURCE_DEST_EQUAL:
             ret = "Source and destination populations equal.";
             break;
-        case MSP_ERR_BAD_RECOMBINATION_MAP:
-            ret = "Bad recombination map provided.";
+        case MSP_ERR_BAD_RATE_MAP:
+            ret = "Bad rate map provided.";
             break;
         case MSP_ERR_INSUFFICIENT_SAMPLES:
             ret = "At least two samples needed.";
@@ -169,8 +169,8 @@ msp_strerror_internal(int err)
         case MSP_ERR_BAD_TRUNCATION_POINT:
             ret = "Bad truncation_point. Must have 0 < truncation_point <= 1";
             break;
-        case MSP_ERR_BAD_MUTATION_MAP_RATE:
-            ret = "Bad mutation rate; must be >= 0.";
+        case MSP_ERR_BAD_RATE_VALUE:
+            ret = "Rates must be non-negative and finite";
             break;
         case MSP_ERR_INCOMPATIBLE_MUTATION_MAP:
             ret = "Mutation map is not compatible with specified tables.";
@@ -183,6 +183,9 @@ msp_strerror_internal(int err)
             break;
         case MSP_ERR_INTERVAL_POSITIONS_UNSORTED:
             ret = "Interval positions must be listed in increasing order";
+            break;
+        case MSP_ERR_NONFINITE_INTERVAL_POSITION:
+            ret = "Interval positions must be finite.";
             break;
         case MSP_ERR_BAD_C:
             ret = "Bad C. Must have 0 < C ";
@@ -207,6 +210,63 @@ msp_strerror_internal(int err)
         case MSP_ERR_BAD_TRANSITION_MATRIX:
             ret = "Each row of the transition matrix must be nonnegative and sum to "
                   "one.";
+            break;
+        case MSP_ERR_BAD_SLIM_PARAMETERS:
+            ret = "SLiM mutation IDs and mutation type IDs must be nonnegative.";
+            break;
+        case MSP_ERR_MUTATION_ID_OVERFLOW:
+            ret = "Mutation ID overflow.";
+            break;
+        case MSP_ERR_BREAKPOINT_MASS_NON_FINITE:
+            ret = "An unlikely numerical error occured computing recombination "
+                  "breakpoints (non finite breakpoint mass). Please check your "
+                  "parameters, and if they make sense help us fix the problem "
+                  "by opening an issue on GitHub.";
+            break;
+        case MSP_ERR_BREAKPOINT_RESAMPLE_OVERFLOW:
+            ret = "An unlikely numerical error occured computing recombination "
+                  "breakpoints (resample overflow). Please check your "
+                  "parameters, and if they make sense help us fix the problem "
+                  "by opening an issue on GitHub.";
+            break;
+        case MSP_ERR_TRACKLEN_RESAMPLE_OVERFLOW:
+            ret = "An unlikely numerical error occured computing gene conversion"
+                  "track lengths (resample overflow). Please check your "
+                  "parameters, and if they make sense help us fix the problem "
+                  "by opening an issue on GitHub.";
+            break;
+        case MSP_ERR_FENWICK_REBUILD_FAILED:
+            ret = "An unlikely numerical error occured (Fenwick tree rebuild "
+                  "did not reduce drift sufficiently). Please check your "
+                  "parameters, and if they make sense help us fix the problem "
+                  "by opening an issue on GitHub.";
+            break;
+        case MSP_ERR_BAD_PLOIDY:
+            ret = "Ploidy must be at least 1";
+            break;
+        case MSP_ERR_DTWF_MIGRATION_MATRIX_NOT_STOCHASTIC:
+            ret = "The row sums of the migration matrix must not exceed one for "
+                  "the discrete time Wright-Fisher model.";
+            break;
+        case MSP_ERR_DTWF_GC_NOT_SUPPORTED:
+            ret = "Gene conversion is not supported in the DTWF model";
+            break;
+        case MSP_ERR_SWEEPS_GC_NOT_SUPPORTED:
+            ret = "Gene conversion is not supported in the selective sweep model";
+            break;
+        case MSP_ERR_BAD_SEQUENCE_LENGTH:
+            ret = "Sequence length must be > 0";
+            break;
+        case MSP_ERR_ZERO_POPULATIONS:
+            ret = "At least one population must be defined";
+            break;
+        case MSP_ERR_BAD_ANCIENT_SAMPLE_NODE:
+            ret = "Only isolated sample nodes are supported as ancient samples";
+            break;
+        case MSP_ERR_UNKNOWN_TIME_NOT_SUPPORTED:
+            ret = "Kept mutations must have known mutation times.";
+        case MSP_ERR_DTWF_DIPLOID_ONLY:
+            ret = "The DTWF model only supports ploidy = 2";
             break;
         default:
             ret = "Error occurred generating error string. Please file a bug "
@@ -252,24 +312,29 @@ __msp_safe_free(void **ptr)
     }
 }
 
-/* Find the `index` of the interval within `values` the `query` fits, such that
- * values[index-1] < query <= values[index]
- * Will find the leftmost such index
- * Assumes `values` are sorted
+/* This function follows standard semantics of:
+ *   numpy.searchsorted(..., side='left') and
+ *   std::lower_bound() from the standard C++ <algorithm> library
+ * PRE-CONDITION:
+ *   1) `values` are sorted and not NaN
+ * RETURNS:
+ *   First (leftmost) `index` of upper bounds of `query`
+ *   **or** `n_values` if no such upper bound is in `values`
+ * POST-CONDITION:
+ *   If `query` is not strictly greather than all values, then::w
+ *     values[index-1] < query <= values[index]
  */
 size_t
 msp_binary_interval_search(double query, const double *values, size_t n_values)
 {
-    if (n_values == 0) {
-        return 0;
-    }
     size_t l = 0;
-    size_t r = n_values - 1;
+    size_t r = n_values;
     size_t m;
 
     while (l < r) {
         m = (l + r) / 2UL;
-
+        /* TODO: uncomment assert when #1203 done and this longer slows down release
+           assert(values[l] <= values[m]); */
         if (values[m] < query) {
             l = m + 1;
         } else {
@@ -283,4 +348,48 @@ bool
 doubles_almost_equal(double a, double b, double eps)
 {
     return (fabs(a) < eps && fabs(b) < eps) || gsl_fcmp(a, b, eps) == 0;
+}
+
+/* Inputs:
+ *   - `lengths` is an array of the real number lengths of `num_intervals`
+ *      consecutive half-open intervals on the real number line start at zero,
+ *      i.e. given lengths L_i, the intervals are:
+ *          [0.0, L_0), [L_0, L_0 + L_1), [L_0 + L_1, L_0 + L_1 + L_2), ...
+ *   - `x` is a real number to find in one of the intervals or after all of them
+ * Returns:
+ *   - the index (starting at zero) of the interval in which `x` was found
+ *   - `num_intervals` if `x` is at or past the end of the last interval
+ *     (the sum of all the lengths)
+ *   - zero if `x` is negative
+ *   - `num_interval` if `x` is NaN
+ * Pre-conditions:
+ *   - `lengths` must point to `num_interval` non-negative non-NaN doubles
+ * Post-condition:
+ *   - returned value is less than or equal to `num_intervals` (and non-negative)
+ *
+ */
+static inline size_t
+positive_interval_select(double x, size_t num_intervals, double const *restrict lengths)
+{
+    size_t i = 0;
+    double sum = 0.0;
+    while (i < num_intervals) {
+        assert(lengths[i] >= 0.0);
+        sum += lengths[i];
+        if (x < sum) {
+            break;
+        }
+        i++;
+    }
+    return i;
+}
+
+/* Convenient helper function to use with random variant `u` and array of probabilities
+ * that approximately sum to one. Note the function does not actually use the last
+ * probability because its correct value is implied by all the previous probabilities.
+ */
+size_t
+probability_list_select(double u, size_t num_probs, double const *probs)
+{
+    return (num_probs > 0 ? positive_interval_select(u, num_probs - 1, probs) : 0);
 }

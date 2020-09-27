@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2019 University of Oxford
+# Copyright (C) 2018-2020 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -20,6 +20,7 @@
 Tests for the provenance information attached to tree sequences.
 """
 import base64
+import inspect
 import json
 import marshal
 import unittest
@@ -28,8 +29,9 @@ import numpy as np
 import python_jsonschema_objects as pjs
 import tskit
 
-import _msprime
 import msprime
+from msprime import _msprime
+from msprime import ancestry
 
 
 class TestProvenance(unittest.TestCase):
@@ -45,6 +47,41 @@ class TestProvenance(unittest.TestCase):
             libs["gsl"], {"version": ".".join(map(str, _msprime.get_gsl_version()))}
         )
         self.assertEqual(libs["tskit"], {"version": tskit.__version__})
+
+
+class TestBuildProvenance(unittest.TestCase):
+    """
+    Tests for the provenance dictionary building. This dictionary is used
+    to encode the parameters for the msprime simulations.
+    """
+
+    def test_basic(self):
+        def somefunc(a, b):
+            frame = inspect.currentframe()
+            return ancestry._build_provenance("cmd", 1234, frame)
+
+        d = somefunc(42, 43)
+        tskit.validate_provenance(d)
+        params = d["parameters"]
+        self.assertEqual(params["command"], "cmd")
+        self.assertEqual(params["random_seed"], 1234)
+        self.assertEqual(params["a"], 42)
+        self.assertEqual(params["b"], 43)
+
+    def test_replicates(self):
+        def somefunc(*, a, b, num_replicates, replicate_index):
+            frame = inspect.currentframe()
+            return ancestry._build_provenance("the_cmd", 42, frame)
+
+        d = somefunc(b="b", a="a", num_replicates=100, replicate_index=1234)
+        tskit.validate_provenance(d)
+        params = d["parameters"]
+        self.assertEqual(params["command"], "the_cmd")
+        self.assertEqual(params["random_seed"], 42)
+        self.assertEqual(params["a"], "a")
+        self.assertEqual(params["b"], "b")
+        self.assertFalse("num_replicates" in d)
+        self.assertFalse("replicate_index" in d)
 
 
 class ValidateSchemas(unittest.TestCase):
@@ -95,6 +132,56 @@ class TestBuildObjects(unittest.TestCase):
         ts = msprime.simulate(5, record_provenance=False)
         self.assertEqual(len(list(ts.provenances())), 0)
 
+    def test_encode_simulation_models(self):
+        simple_model = ["hudson", [10, "dtwf"], [20, "smc"], [None, None]]
+        ts = msprime.simulate(10, model=simple_model)
+        decoded = self.decode(ts.provenance(0).record)
+        parameters = decoded.parameters
+        self.assertEqual(parameters.sample_size, 10)
+        self.assertEqual(list(parameters.model), simple_model)
+
+        model_instances = [
+            msprime.StandardCoalescent(),
+            msprime.SimulationModelChange(10, msprime.DiscreteTimeWrightFisher()),
+            msprime.SimulationModelChange(20, msprime.SmcApproxCoalescent()),
+            msprime.SimulationModelChange(30, msprime.BetaCoalescent(alpha=1.1)),
+        ]
+        ts = msprime.simulate(10, model=model_instances)
+        decoded = self.decode(ts.provenance(0).record)
+        parameters = decoded.parameters
+        self.assertEqual(parameters.sample_size, 10)
+        self.assertEqual(
+            parameters.model[0], {"__class__": "msprime.ancestry.StandardCoalescent"}
+        )
+        self.assertDictEqual(
+            parameters.model[1],
+            {
+                "__class__": "msprime.ancestry.SimulationModelChange",
+                "model": {"__class__": "msprime.ancestry.DiscreteTimeWrightFisher"},
+                "time": 10,
+            },
+        )
+        self.assertDictEqual(
+            parameters.model[2],
+            {
+                "__class__": "msprime.ancestry.SimulationModelChange",
+                "model": {"__class__": "msprime.ancestry.SmcApproxCoalescent"},
+                "time": 20,
+            },
+        )
+        self.assertDictEqual(
+            parameters.model[3],
+            {
+                "__class__": "msprime.ancestry.SimulationModelChange",
+                "model": {
+                    "__class__": "msprime.ancestry.BetaCoalescent",
+                    "alpha": 1.1,
+                    "truncation_point": 1.0,
+                },
+                "time": 30,
+            },
+        )
+
     def test_encode_numpy_functions_and_classes(self):
         seeds = np.ones(1, dtype=int)
         pop_configs = [msprime.PopulationConfiguration(5) for _ in range(2)]
@@ -140,14 +227,14 @@ class TestBuildObjects(unittest.TestCase):
             [
                 {
                     "sample_size": 5,
-                    "initial_size": 1,
+                    "initial_size": None,
                     "growth_rate": 0.0,
                     "metadata": None,
                     "__class__": "msprime.demography.PopulationConfiguration",
                 },
                 {
                     "sample_size": 5,
-                    "initial_size": 1,
+                    "initial_size": None,
                     "growth_rate": 0.0,
                     "metadata": None,
                     "__class__": "msprime.demography.PopulationConfiguration",
@@ -165,7 +252,7 @@ class TestBuildObjects(unittest.TestCase):
                     "defaults": None,
                 },
                 "model": None,
-                "__class__": "msprime.demography.SimulationModelChange",
+                "__class__": "msprime.ancestry.SimulationModelChange",
             },
         )
         self.assertDictEqual(
@@ -177,7 +264,7 @@ class TestBuildObjects(unittest.TestCase):
                     " ('msprime',) which are not currently serialized"
                 },
                 "model": None,
-                "__class__": "msprime.demography.SimulationModelChange",
+                "__class__": "msprime.ancestry.SimulationModelChange",
             },
         ),
         self.assertDictEqual(
@@ -188,7 +275,7 @@ class TestBuildObjects(unittest.TestCase):
                     " variables which are not currently serialized"
                 },
                 "model": None,
-                "__class__": "msprime.demography.SimulationModelChange",
+                "__class__": "msprime.ancestry.SimulationModelChange",
             },
         )
 
@@ -237,31 +324,36 @@ class TestBuildObjects(unittest.TestCase):
         self.assertEqual(decoded.parameters.end_time, 100)
         self.assertEqual(decoded.parameters.keep, False)
         self.assertEqual(
-            decoded.parameters.model["__class__"], "msprime.mutations.BinaryMutations"
+            decoded.parameters.model["__class__"],
+            "msprime.mutations.BinaryMutationModel",
         )
 
     def test_mutate_model(self):
         ts = msprime.simulate(5, random_seed=1)
-        ts = msprime.mutate(ts, model=msprime.JukesCantor())
+        ts = msprime.mutate(ts, model="jc69")
         decoded = self.decode(ts.provenance(1).record)
         self.assertEqual(decoded.schema_version, "1.0.0")
         self.assertEqual(decoded.parameters.command, "mutate")
         self.assertEqual(
-            decoded.parameters.model["__class__"], "msprime.mutations.JukesCantor"
+            decoded.parameters.model["__class__"], "msprime.mutations.JC69MutationModel"
         )
 
     def test_mutate_map(self):
         ts = msprime.simulate(5, random_seed=1)
-        rate_map = msprime.MutationMap(position=[0, 0.5, 1], rate=[0, 1, 0])
+        rate_map = msprime.RateMap(position=[0, 0.5, 1], rate=[0, 1])
         ts = msprime.mutate(ts, rate=rate_map)
         decoded = self.decode(ts.provenance(1).record)
         self.assertEqual(decoded.schema_version, "1.0.0")
         self.assertEqual(decoded.parameters.command, "mutate")
         self.assertEqual(
-            decoded.parameters.rate["__class__"], "msprime.mutations.MutationMap"
+            decoded.parameters.rate["__class__"], "msprime.intervals.RateMap"
         )
-        self.assertEqual(decoded.parameters.rate["position"], rate_map.position)
-        self.assertEqual(decoded.parameters.rate["rate"], rate_map.rate)
+        self.assertEqual(
+            decoded.parameters.rate["position"]["__ndarray__"], list(rate_map.position)
+        )
+        self.assertEqual(
+            decoded.parameters.rate["rate"]["__ndarray__"], list(rate_map.rate)
+        )
 
     def test_mutate_numpy(self):
         ts = msprime.simulate(5, random_seed=1)
@@ -349,6 +441,20 @@ class TestSimulateRoundTrip(TestRoundTrip):
         )
         self.verify(ts)
 
+    def test_simulation_models(self):
+        simple_model = ["hudson", [10, "dtwf"], [20, "smc"]]
+        ts = msprime.simulate(10, model=simple_model)
+        self.verify(ts)
+
+        model_instances = [
+            msprime.StandardCoalescent(),
+            msprime.SimulationModelChange(10, msprime.DiscreteTimeWrightFisher()),
+            msprime.SimulationModelChange(20, msprime.SmcApproxCoalescent()),
+            msprime.SimulationModelChange(30, msprime.BetaCoalescent(alpha=1.1)),
+        ]
+        ts = msprime.simulate(10, model=model_instances)
+        self.verify(ts)
+
     def test_pedigree(self):
         inds = np.array([1, 2, 3, 4, 5, 6])
         parent_indices = np.array([4, 5, 4, 5, 4, 5, 4, 5, -1, -1, -1, -1]).reshape(
@@ -365,7 +471,7 @@ class TestSimulateRoundTrip(TestRoundTrip):
             sample_size=4,
             pedigree=ped,
             demographic_events=[
-                msprime.SimulationModelChange(t, msprime.DiscreteTimeWrightFisher(2))
+                msprime.SimulationModelChange(t, msprime.DiscreteTimeWrightFisher())
             ],
             model=model,
         )
@@ -383,6 +489,12 @@ class TestMutateRoundTrip(TestRoundTrip):
         ts = msprime.mutate(
             ts, rate=2, random_seed=1, start_time=0, end_time=100, keep=False
         )
+        self.verify(ts)
+
+    def test_mutate_rate_map(self):
+        ts = msprime.simulate(5, random_seed=1)
+        rate_map = msprime.RateMap(position=[0, 0.5, 1], rate=[0, 1])
+        ts = msprime.mutate(ts, rate=rate_map)
         self.verify(ts)
 
 

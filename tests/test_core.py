@@ -1,9 +1,9 @@
 #
 # Copyright (C) 2015-2020 University of Oxford
 #
-# This file is part of utils.
+# This file is part of msprime.
 #
-# utils.is free software: you can redistribute it and/or modify
+# msprime is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
@@ -20,8 +20,9 @@
 Test cases for the high level interface to utils.
 """
 import multiprocessing
-import sys
 import unittest
+
+import numpy as np
 
 import msprime.core as core
 
@@ -73,25 +74,42 @@ class TestDefaultRandomSeeds(unittest.TestCase):
         pool.join()
 
 
-class TestAlmostEqual(unittest.TestCase):
+class TestIsInteger(unittest.TestCase):
     """
-    Simple tests to ensure that the almost_equal() method is sensible.
+    Tests for the function used to determine if a value can be interpreted
+    as an integer.
     """
 
-    def test_defaults(self):
-        eps = sys.float_info.epsilon
-        equal = [(1, 1), (0, 0), (1 + eps, 1), (1, 1 - eps), (10.000000000001, 10.0)]
-        for a, b in equal:
-            self.assertAlmostEqual(a, b)
-            self.assertTrue(core.almost_equal(a, b))
+    def test_good_values(self):
+        numpy_int_array = np.array([100], dtype=int)
+        numpy_float_array = np.array([100], dtype=np.float64)
+        good_values = [
+            -1,
+            0,
+            10 ** 6,
+            "1",
+            "100_000",
+            0x123,
+            1.0,
+            numpy_int_array[0],
+            numpy_int_array,
+            numpy_float_array,
+            numpy_float_array[0],
+        ]
+        for good_value in good_values:
+            self.assertTrue(core.isinteger(good_value))
 
-    def test_near_zero(self):
-        eps = sys.float_info.epsilon
-        equal = [(0, 0), (eps, 0), (0, -eps), (-eps, eps)]
-        for a, b in equal:
-            self.assertAlmostEqual(a, b)
-            self.assertTrue(core.almost_equal(a, b, abs_tol=1e-9))
-        not_equal = [(0, 0.0000001), (-0.0000001, 0)]
-        for a, b in not_equal:
-            self.assertNotAlmostEqual(a, b)
-            self.assertFalse(core.almost_equal(a, b, abs_tol=1e-9))
+    def test_bad_values(self):
+        numpy_float_array = np.array([100.1], dtype=np.float64)
+        bad_values = [
+            [],
+            None,
+            {},
+            numpy_float_array,
+            numpy_float_array[0],
+            1.1,
+            "1.1",
+            1e-3,
+        ]
+        for bad_value in bad_values:
+            self.assertFalse(core.isinteger(bad_value))

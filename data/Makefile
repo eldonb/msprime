@@ -1,4 +1,4 @@
-all: scrm ms msHOT slim seq-gen
+all: scrm ms msHOT slim seq-gen msms
 
 seq-gen:
 	rm -fR seq-gen Seq-Gen* 1.3.4.tar.gz
@@ -34,11 +34,22 @@ msHOT:
 	cp msHOTdir/msHOT_summary_stats ./
 
 discoal:
-	wget https://github.com/kern-lab/discoal/archive/v0.1.4.tar.gz
-	tar -xf v0.1.4.tar.gz
-	cd discoal-0.1.4/ && make
-	cp discoal-0.1.4/discoal ./
+	wget https://github.com/kern-lab/discoal/archive/v0.1.5.tar.gz
+	tar -xf v0.1.5.tar.gz
+	# To allow larger num_sites, a macro in the header file is updated
+	sed -i -e 's/^#define MAXSITES.*$$/#define MAXSITES 500000/' \
+		discoal-0.1.5/discoal.h 
+	cd discoal-0.1.5/ && make
+	cp discoal-0.1.5/discoal ./
+
+msms:
+	wget https://www.mabs.at/ewing/msms/msms3.2rc-b163.jar
+	mv msms3.2rc-b163.jar msms.jar
+
+msprime-0.7.4:
+	python3 -m venv msprime-0.7.4
+	bash -c "source msprime-0.7.4/bin/activate; pip install msprime==0.7.4"
 
 clean:
 	rm -fR scrm* ms ms_summary_stats msHOT msHOT_summary_stats sample_stats \
-		discoal* v0.1.4.tar.gz* seq-gen SeqGen*
+		discoal* v0.1.4.tar.gz* seq-gen SeqGen* SLiM msms.jar msprime*

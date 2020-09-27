@@ -22,7 +22,7 @@ Core functions and classes used throughout msprime.
 import os
 import random
 
-import _msprime
+from msprime import _msprime
 
 __version__ = "undefined"
 try:
@@ -71,14 +71,14 @@ def get_random_seed():
     return _seed_rng_map[pid].randint(1, 2 ** 32 - 1)
 
 
-# Note, this is no longer needed as we have Python 3.6 minimum.
-# https://github.com/tskit-dev/msprime/issues/960
-def almost_equal(a, b, rel_tol=1e-9, abs_tol=0.0):
+def isinteger(value):
     """
-    Returns true if the specified pair of numbers are equal to
-    within the specified tolerances.
-
-    The signature and implementation are taken from PEP 485,
-    https://www.python.org/dev/peps/pep-0485/
+    Returns True if the specified value can be converted losslessly to an
+    integer.
     """
-    return abs(a - b) <= max(rel_tol * max(abs(a), abs(b)), abs_tol)
+    try:
+        int_val = int(value)
+        float_val = float(value)
+        return int_val == float_val
+    except (ValueError, TypeError):
+        return False

@@ -34,12 +34,6 @@ import tskit
 import msprime
 import msprime.cli as cli
 
-_h5py_available = True
-try:
-    import h5py
-except ImportError:
-    _h5py_available = False
-
 
 def capture_output(func, *args, **kwargs):
     """
@@ -570,7 +564,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
 
     def test_recomb_map(self):
         runner = self.create_runner("15 1000 -t 10.04 -r 100.0 2501")
-        uniform = msprime.RecombinationMap([0, 2501], [0.04, 0], discrete=True)
+        uniform = msprime.RecombinationMap([0, 2501], [0.04, 0])
         actual = runner.get_recomb_map()
         self.assertEqual(actual.get_positions(), uniform.get_positions())
         self.assertEqual(actual.get_rates(), uniform.get_rates())
@@ -602,56 +596,60 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_structure_args(self):
         sim = self.create_simulator("2 1 -T")
         self.assertEqual(sim.sample_configuration, [2])
-        self.assertEqual(sim.migration_matrix, [[0]])
+        self.assertEqual(sim.demography.migration_matrix, [[0]])
 
         # Specifying 1 population is the same as the default.
         sim = self.create_simulator("2 1 -T -I 1 2")
         self.assertEqual(sim.sample_configuration, [2])
-        self.assertEqual(sim.migration_matrix, [[0]])
+        self.assertEqual(sim.demography.migration_matrix, [[0]])
 
         sim = self.create_simulator("2 1 -T -I 2 1 1")
         self.assertEqual(sim.sample_configuration, [1, 1])
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 0], [0, 0]])
+        np.testing.assert_array_equal(sim.demography.migration_matrix, [[0, 0], [0, 0]])
 
         # Default migration matrix is zeros
         sim = self.create_simulator("2 1 -T -I 2 2 0")
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 0], [0, 0]])
+        np.testing.assert_array_equal(sim.demography.migration_matrix, [[0, 0], [0, 0]])
         self.assertEqual(sim.sample_configuration, [2, 0])
 
         sim = self.create_simulator("2 1 -T -I 2 1 1 0.1")
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 0.1], [0.1, 0]])
+        np.testing.assert_array_equal(
+            sim.demography.migration_matrix, [[0, 0.1], [0.1, 0]]
+        )
         self.assertEqual(sim.sample_configuration, [1, 1])
 
         # Initial migration matrix is M / (num_pops - 1)
         sim = self.create_simulator("3 1 -T -I 3 1 1 1 2")
         self.assertEqual(sim.sample_configuration, [1, 1, 1])
         np.testing.assert_array_equal(
-            sim.migration_matrix, [[0, 1, 1], [1, 0, 1], [1, 1, 0]]
+            sim.demography.migration_matrix, [[0, 1, 1], [1, 0, 1], [1, 1, 0]]
         )
         sim = self.create_simulator("15 1 -T -I 6 5 4 3 2 1 0")
         self.assertEqual(sim.sample_configuration, [5, 4, 3, 2, 1, 0])
 
     def test_migration_matrix_entry(self):
         sim = self.create_simulator("3 1 -T -I 2 3 0 -m 1 2 1.1 -m 2 1 9.0")
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 1.1], [9.0, 0]])
+        np.testing.assert_array_equal(
+            sim.demography.migration_matrix, [[0, 1.1], [9.0, 0]]
+        )
         sim = self.create_simulator("3 1 -T -I 3 3 0 0 -m 1 2 1.1 -m 2 1 9.0")
         np.testing.assert_array_equal(
-            sim.migration_matrix, [[0, 1.1, 0], [9.0, 0, 0], [0, 0, 0]]
+            sim.demography.migration_matrix, [[0, 1.1, 0], [9.0, 0, 0], [0, 0, 0]]
         )
 
     def test_migration_matrix(self):
         sim = self.create_simulator("2 1 -T -I 2 2 0 -ma 0 1 2 3")
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 1], [2, 0]])
+        np.testing.assert_array_equal(sim.demography.migration_matrix, [[0, 1], [2, 0]])
         sim = self.create_simulator("2 1 -T -I 2 2 0 -ma x 1 2 x")
-        np.testing.assert_array_equal(sim.migration_matrix, [[0, 1], [2, 0]])
+        np.testing.assert_array_equal(sim.demography.migration_matrix, [[0, 1], [2, 0]])
         sim = self.create_simulator("3 1 -T -I 3 1 1 1 -ma 1 2 3 4 5 6 7 8 9")
         np.testing.assert_array_equal(
-            sim.migration_matrix, [[0, 2, 3], [4, 0, 6], [7, 8, 0]]
+            sim.demography.migration_matrix, [[0, 2, 3], [4, 0, 6], [7, 8, 0]]
         )
 
     def test_simultaneous_events(self):
         sim = self.create_simulator("2 1 -T -eN 1 2.0 -eG 1.0 3 -eN 1 4")
-        events = sim.demographic_events
+        events = sim.demography.events
         self.assertEqual(len(events), 3)
         for event in events:
             self.assertEqual(event.time, 1.0)
@@ -669,8 +667,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
         def f(args):
             sim = self.create_simulator(args)
             return [
-                (c.initial_size * 4, c.growth_rate)
-                for c in sim.population_configurations
+                (c.initial_size * 4, c.growth_rate) for c in sim.demography.populations
             ]
 
         self.assertEqual(f("2 1 -T -I 3 2 0 0 -g 1 -1"), [(1, -1), (1, 0), (1, 0)])
@@ -691,8 +688,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
         def f(args):
             sim = self.create_simulator(args)
             return [
-                (c.initial_size * 4, c.growth_rate)
-                for c in sim.population_configurations
+                (c.initial_size * 4, c.growth_rate) for c in sim.demography.populations
             ]
 
         self.assertEqual(f("2 1 -T -I 3 2 0 0 -n 1 2"), [(2, 0), (1, 0), (1, 0)])
@@ -711,7 +707,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_population_growth_rate_change(self):
         def f(args):
             sim = self.create_simulator(args)
-            return sim.demographic_events
+            return sim.demography.events
 
         events = f("2 1 -T -eg 0.1 1 2")
         self.assertEqual(len(events), 1)
@@ -733,7 +729,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_population_size_change(self):
         def f(args):
             sim = self.create_simulator(args)
-            return sim.demographic_events
+            return sim.demography.events
 
         events = f("2 1 -T -en 0.1 1 2")
         self.assertEqual(len(events), 1)
@@ -758,7 +754,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_migration_rate_change(self):
         def check(args, results):
             sim = self.create_simulator(args)
-            events = sim.demographic_events
+            events = sim.demography.events
             self.assertEqual(len(events), len(results))
             for event, result in zip(events, results):
                 self.assertIsInstance(event, msprime.MigrationRateChange)
@@ -773,7 +769,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_migration_matrix_entry_change(self):
         def check(args, results):
             sim = self.create_simulator(args)
-            events = sim.demographic_events
+            events = sim.demography.events
             self.assertEqual(len(events), len(results))
             for event, result in zip(events, results):
                 self.assertIsInstance(event, msprime.MigrationRateChange)
@@ -791,11 +787,11 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
         def check(args, results):
             sim = self.create_simulator(args)
             # Make sure we haven't changed the initial matrix.
-            matrix = sim.migration_matrix
+            matrix = sim.demography.migration_matrix
             for row in matrix:
                 for entry in row:
                     self.assertEqual(entry, 0.0)
-            events = sim.demographic_events
+            events = sim.demography.events
             self.assertEqual(len(events), len(results))
             for event, result in zip(events, results):
                 self.assertIsInstance(event, msprime.MigrationRateChange)
@@ -821,7 +817,7 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_population_split(self):
         def check(N, args, results):
             sim = self.create_simulator(args)
-            events = sim.demographic_events
+            events = sim.demography.events
             self.assertEqual(len(events), len(results) * N)
             k = 0
             for result in results:
@@ -855,11 +851,11 @@ class TestMspmsCreateSimulationRunner(unittest.TestCase):
     def test_admixture(self):
         def check(N, args, results):
             sim = self.create_simulator(args)
-            events = sim.demographic_events
+            events = sim.demography.events
             self.assertEqual(sim.num_populations, N)
             self.assertEqual(len(events), len(results))
             matrix = [[0 for _ in range(N)] for _ in range(N)]
-            np.testing.assert_array_equal(sim.migration_matrix, matrix)
+            np.testing.assert_array_equal(sim.demography.migration_matrix, matrix)
             for result, event in zip(results, events):
                 self.assertIsInstance(event, msprime.MassMigration)
                 self.assertEqual(event.time, result[0])
@@ -1252,205 +1248,6 @@ class TestMspArgumentParser(unittest.TestCase):
         self.assertEqual(args.random_seed, 123)
         self.assertEqual(args.compress, True)
 
-    def test_nodes_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "nodes"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 6)
-
-    def test_nodes_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "nodes"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-p", "8"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 8)
-
-    def test_nodes_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "nodes"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--precision", "5"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 5)
-
-    def test_edges_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "edges"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 6)
-
-    def test_edges_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "edges"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-p", "8"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 8)
-
-    def test_edges_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "edges"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--precision", "5"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 5)
-
-    def test_sites_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "sites"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 6)
-
-    def test_sites_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "sites"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-p", "8"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 8)
-
-    def test_sites_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "sites"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--precision", "5"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 5)
-
-    def test_mutations_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "mutations"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 6)
-
-    def test_mutations_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "mutations"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-p", "4"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 4)
-
-    def test_mutations_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "mutations"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--precision", "9"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 9)
-
-    def test_provenances_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "provenances"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.human, False)
-
-    def test_provenances_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "provenances"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-H"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.human, True)
-
-    def test_provenances_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "provenances"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--human"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.human, True)
-
-    def test_vcf_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "vcf"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.ploidy, 1)
-
-    def test_vcf_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "vcf"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-P", "2"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.ploidy, 2)
-
-    def test_vcf_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "vcf"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--ploidy", "5"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.ploidy, 5)
-
-    def test_haplotypes_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "haplotypes"
-        tree_sequence = "test1.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-
-    def test_variants_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "variants"
-        tree_sequence = "test1.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-
-    def test_macs_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "macs"
-        tree_sequence = "test2.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-
-    def test_newick_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "newick"
-        tree_sequence = "test3.trees"
-        args = parser.parse_args([cmd, tree_sequence])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 3)
-
-    def test_newick_short_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "newick"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "-p", "10"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 10)
-
-    def test_newick_long_args(self):
-        parser = cli.get_msp_parser()
-        cmd = "newick"
-        tree_sequence = "test.trees"
-        args = parser.parse_args([cmd, tree_sequence, "--precision=5"])
-        self.assertEqual(args.tree_sequence, tree_sequence)
-        self.assertEqual(args.precision, 5)
-
-    def test_upgrade_default_values(self):
-        parser = cli.get_msp_parser()
-        cmd = "upgrade"
-        source = "in.trees"
-        destination = "out.trees"
-        args = parser.parse_args([cmd, source, destination])
-        self.assertEqual(args.source, source)
-        self.assertEqual(args.destination, destination)
-        self.assertEqual(args.remove_duplicate_positions, False)
-
 
 class TestMspSimulateOutput(unittest.TestCase):
     """
@@ -1510,225 +1307,69 @@ class TestMspConversionOutput(unittest.TestCase):
     def tearDownClass(cls):
         os.unlink(cls._tree_sequence_file)
 
-    def verify_nodes(self, output_nodes, precision):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.dump_text(nodes=f, precision=precision)
-            f.seek(0)
-            output = f.read().splitlines()
-        self.assertEqual(output, output_nodes)
-
-    def test_nodes(self):
-        cmd = "nodes"
-        precision = 8
-        stdout, stderr = capture_output(
-            cli.msp_main, [cmd, self._tree_sequence_file, "-p", str(precision)]
+    def test_mutate_keep(self):
+        fd, out_tree_sequence_file = tempfile.mkstemp(
+            prefix="msp_cli_mutate", suffix=".trees"
         )
-        self.assertEqual(len(stderr), 0)
-        output_nodes = stdout.splitlines()
-        self.verify_nodes(output_nodes, precision)
-
-    def verify_edges(self, output_edges, precision):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.dump_text(edges=f, precision=precision)
-            f.seek(0)
-            output = f.read().splitlines()
-        self.assertEqual(output, output_edges)
-
-    def test_edges(self):
-        cmd = "edges"
-        precision = 8
-        stdout, stderr = capture_output(
-            cli.msp_main, [cmd, self._tree_sequence_file, "-p", str(precision)]
-        )
-        self.assertEqual(len(stderr), 0)
-        output_edges = stdout.splitlines()
-        self.verify_edges(output_edges, precision)
-
-    def verify_sites(self, output_sites, precision):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.dump_text(sites=f, precision=precision)
-            f.seek(0)
-            output = f.read().splitlines()
-        self.assertEqual(output, output_sites)
-
-    def test_sites(self):
-        cmd = "sites"
-        precision = 8
-        stdout, stderr = capture_output(
-            cli.msp_main, [cmd, self._tree_sequence_file, "-p", str(precision)]
-        )
-        self.assertEqual(len(stderr), 0)
-        output_sites = stdout.splitlines()
-        self.verify_sites(output_sites, precision)
-
-    def verify_mutations(self, output_mutations, precision):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.dump_text(mutations=f, precision=precision)
-            f.seek(0)
-            output = f.read().splitlines()
-        self.assertEqual(output, output_mutations)
-
-    def test_mutations(self):
-        cmd = "mutations"
-        precision = 8
-        stdout, stderr = capture_output(
-            cli.msp_main, [cmd, self._tree_sequence_file, "-p", str(precision)]
-        )
-        self.assertEqual(len(stderr), 0)
-        output_mutations = stdout.splitlines()
-        self.verify_mutations(output_mutations, precision)
-
-    def verify_provenances(self, output_provenances):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.dump_text(provenances=f)
-            f.seek(0)
-            output = f.read().splitlines()
-        self.assertEqual(output, output_provenances)
-
-    def test_provenances(self):
-        cmd = "provenances"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        output_provenances = stdout.splitlines()
-        self.verify_provenances(output_provenances)
-
-    def test_provenances_human(self):
-        cmd = "provenances"
-        stdout, stderr = capture_output(
-            cli.msp_main, [cmd, "-H", self._tree_sequence_file]
-        )
-        self.assertEqual(len(stderr), 0)
-        output_provenances = stdout.splitlines()
-        # TODO Check the actual output here.
-        self.assertGreater(len(output_provenances), 0)
-
-    def verify_vcf(self, output_vcf):
-        with tempfile.TemporaryFile("w+") as f:
-            self._tree_sequence.write_vcf(f)
-            f.seek(0)
-            vcf = f.read()
-        self.assertEqual(output_vcf, vcf)
-
-    def test_vcf(self):
-        cmd = "vcf"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        self.verify_vcf(stdout)
-
-    def verify_haplotypes(self, output_haplotypes):
-        haplotypes = list(self._tree_sequence.haplotypes())
-        self.assertEqual(len(haplotypes), len(output_haplotypes))
-        for h, line in zip(haplotypes, output_haplotypes):
-            self.assertEqual(h, line)
-
-    def test_haplotypes(self):
-        cmd = "haplotypes"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        output_haplotypes = stdout.splitlines()
-        self.verify_haplotypes(output_haplotypes)
-
-    def verify_variants(self, output_variants):
-        variants = [
-            (v.position, v.genotypes.decode())
-            for v in self._tree_sequence.variants(as_bytes=True)
-        ]
-        self.assertEqual(len(variants), len(output_variants))
-        for (pos, v), line in zip(variants, output_variants):
-            self.assertEqual(f"{pos}\t{v}", line)
-
-    def test_variants(self):
-        cmd = "variants"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        output_variants = stdout.splitlines()
-        self.verify_variants(output_variants)
-
-    def verify_newick(self, output_newick):
-        newick = list(tree.newick(precision=3) for tree in self._tree_sequence.trees())
-        self.assertEqual(len(newick), len(output_newick))
-        for tree, line in zip(newick, output_newick):
-            self.assertEqual(tree, line)
-
-    def test_newick(self):
-        cmd = "newick"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        output_newick = stdout.splitlines()
-        self.verify_newick(output_newick)
-
-    def test_macs(self):
-        cmd = "macs"
-        stdout, stderr = capture_output(cli.msp_main, [cmd, self._tree_sequence_file])
-        self.assertEqual(len(stderr), 0)
-        output = stdout.splitlines()
-        self.assertTrue(output[0].startswith("COMMAND:"))
-        self.assertTrue(output[1].startswith("SEED:"))
-        self.assertEqual(len(output), 2 + self._tree_sequence.get_num_mutations())
-        n = self._tree_sequence.get_sample_size()
-        m = self._tree_sequence.get_sequence_length()
-        sites = list(self._tree_sequence.sites())
-        haplotypes = list(self._tree_sequence.haplotypes())
-        for site_id, line in enumerate(output[2:]):
-            splits = line.split()
-            self.assertEqual(splits[0], "SITE:")
-            self.assertEqual(int(splits[1]), site_id)
-            position = sites[site_id].position / m
-            self.assertAlmostEqual(float(splits[2]), position)
-            col = splits[4]
-            self.assertEqual(len(col), n)
-            for j in range(n):
-                self.assertEqual(col[j], haplotypes[j][site_id])
-
-
-@unittest.skipIf(not _h5py_available, "h5py not installed, skipping upgrade tests")
-class TestUpgrade(TestCli):
-    """
-    Tests the results of the upgrade operation to ensure they are
-    correct.
-    """
-
-    def setUp(self):
-        fd, self.legacy_file_name = tempfile.mkstemp(prefix="msp_cli", suffix=".trees")
-        os.close(fd)
-        fd, self.current_file_name = tempfile.mkstemp(prefix="msp_cli", suffix=".trees")
         os.close(fd)
 
-    def tearDown(self):
-        os.unlink(self.legacy_file_name)
-        os.unlink(self.current_file_name)
+        cmd = "mutate"
+        mutation_rate = 10
+        seed = 1
+        stdout, stderr = capture_output(
+            cli.msp_main,
+            [
+                cmd,
+                self._tree_sequence_file,
+                out_tree_sequence_file,
+                "-u",
+                str(mutation_rate),
+                "-s",
+                str(seed),
+                "--keep",
+            ],
+        )
+        self.assertEqual(len(stderr), 0)
 
-    def test_conversion(self):
-        ts1 = msprime.simulate(10)
-        for version in [2, 3]:
-            tskit.dump_legacy(ts1, self.legacy_file_name, version=version)
-            stdout, stderr = capture_output(
-                cli.msp_main, ["upgrade", self.legacy_file_name, self.current_file_name]
-            )
-            ts2 = tskit.load(self.current_file_name)
-            self.assertEqual(stdout, "")
-            # We get some cruft on stderr that comes from h5py. This only happens
-            # because we're mixing h5py and msprime for this test, so we can ignore
-            # it.
-            # self.assertEqual(stderr, "")
-            # Quick checks to ensure we have the right tree sequence.
-            # More thorough checks are done elsewhere.
-            self.assertEqual(ts1.get_sample_size(), ts2.get_sample_size())
-            self.assertEqual(ts1.num_edges, ts2.num_edges)
-            self.assertEqual(ts1.get_num_trees(), ts2.get_num_trees())
+        previous_ts = tskit.load(self._tree_sequence_file)
+        tree_sequence = tskit.load(out_tree_sequence_file)
 
-    def test_duplicate_positions(self):
-        ts = msprime.simulate(10, mutation_rate=10)
-        for version in [2, 3]:
-            tskit.dump_legacy(ts, self.legacy_file_name, version=version)
-            root = h5py.File(self.legacy_file_name, "r+")
-            root["mutations/position"][:] = 0
-            root.close()
-            stdout, stderr = capture_output(
-                cli.msp_main,
-                ["upgrade", "-d", self.legacy_file_name, self.current_file_name],
-            )
-            self.assertEqual(stdout, "")
-            tsp = tskit.load(self.current_file_name)
-            self.assertEqual(tsp.sample_size, ts.sample_size)
-            self.assertEqual(tsp.num_sites, 1)
+        self.assertGreater(
+            tree_sequence.get_num_mutations(), previous_ts.get_num_mutations()
+        )
+
+    def test_mutate_discrete_start_end_time(self):
+        fd, out_tree_sequence_file = tempfile.mkstemp(
+            prefix="msp_cli_mutate", suffix=".trees"
+        )
+        os.close(fd)
+
+        cmd = "mutate"
+        mutation_rate = 10
+        seed = 1
+        stdout, stderr = capture_output(
+            cli.msp_main,
+            [
+                cmd,
+                self._tree_sequence_file,
+                out_tree_sequence_file,
+                "-u",
+                str(mutation_rate),
+                "-s",
+                str(seed),
+                "--discrete",
+                "--start-time",
+                "0",
+                "--end-time",
+                "2",
+            ],
+        )
+        self.assertEqual(len(stderr), 0)
+
+        tree_sequence = tskit.load(out_tree_sequence_file)
+        tables = tree_sequence.dump_tables()
+
+        self.assertLessEqual(max(tables.nodes.time[tables.mutations.node]), 2)
+        self.assertGreaterEqual(min(tables.nodes.time[tables.mutations.node]), 0)
+        self.assertLessEqual(set(tables.sites.position), set(range(10)))
+        self.assertGreater(tree_sequence.get_num_mutations(), 0)

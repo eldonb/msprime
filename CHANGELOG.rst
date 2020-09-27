@@ -15,6 +15,35 @@
 - Add replicate_index to simulate, allowing output of a single tree sequence
   from a set of replicates. (:user:`benjeffery` :pr:`914`).
 
+- Much better simulation performance for models with large numbers
+  of populations (:user:`jeromekelleher`, :pr:`1069`).
+
+- Details of the simulation are written to the DEBUG log periodically.
+  This can help debug long-running simulations. (:user:`jeromekelleher`,
+  :pr:`1080`).
+
+- Add a ``discrete_coordinates`` argument to `simulate`, which ensures that
+  all recombination breakpoints and mutational sites are at integer positions
+  (:user:`jeromekelleher`, :issue:`880`, :pr:`1115`).
+
+**Breaking changes**:
+
+- The class form for specifying models (e.g., ``msprime.StandardCoalescent()``)
+  no longer take a ``reference_size`` argument.
+  (TODO add paper trail for this)
+
+- The ``simulate`` function only takes one positional argument, and all other
+  arguments are keyword-only.
+
+- The ``msp`` CLI has been stripped of all sub-commands except for
+  ``simulate`` and ``mutate``. These sub-commands are provided by the ``tskit``
+  CLI or the ``TreeSequence`` API in ``tskit``.
+
+**Deprecations**:
+
+- Deprecate module attributes that were moved to tskit.
+  (:user:`benjeffery`, :issue:`991`, :pr:`1158`)
+
 ********************
 [0.7.4] - 2019-12-05
 ********************

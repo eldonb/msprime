@@ -33,6 +33,8 @@
 #else
 #define MSP_WARN_UNUSED
 #define MSP_UNUSED(x) MSP_UNUSED_##x
+/* Don't bother with restrict for MSVC */
+#define restrict
 #endif
 
 /* clang-format off */
@@ -52,7 +54,7 @@
 #define MSP_ERR_INFINITE_WAITING_TIME                               -13
 #define MSP_ERR_ASSERTION_FAILED                                    -14
 #define MSP_ERR_SOURCE_DEST_EQUAL                                   -15
-#define MSP_ERR_BAD_RECOMBINATION_MAP                               -16
+#define MSP_ERR_BAD_RATE_MAP                                        -16
 #define MSP_ERR_BAD_POPULATION_SIZE                                 -17
 #define MSP_ERR_BAD_SAMPLES                                         -18
 #define MSP_ERR_BAD_MODEL                                           -19
@@ -79,11 +81,11 @@
 #define MSP_ERR_BAD_PEDIGREE_ID                                     -40
 #define MSP_ERR_BAD_BETA_MODEL_ALPHA                                -41
 #define MSP_ERR_BAD_TRUNCATION_POINT                                -42
-#define MSP_ERR_BAD_MUTATION_MAP_RATE                               -43
+#define MSP_ERR_BAD_RATE_VALUE                                      -43
 #define MSP_ERR_INCOMPATIBLE_MUTATION_MAP                           -44
 #define MSP_ERR_INSUFFICIENT_INTERVALS                              -45
 #define MSP_ERR_INTERVAL_MAP_START_NON_ZERO                         -46
-#define MSP_ERR_NEGATIVE_INTERVAL_POSITION                          -47
+#define MSP_ERR_NONFINITE_INTERVAL_POSITION                         -47
 #define MSP_ERR_INTERVAL_POSITIONS_UNSORTED                         -48
 #define MSP_ERR_BAD_C                                               -49
 #define MSP_ERR_BAD_PSI                                             -50
@@ -92,6 +94,22 @@
 #define MSP_ERR_INSUFFICIENT_ALLELES                                -53
 #define MSP_ERR_BAD_ROOT_PROBABILITIES                              -54
 #define MSP_ERR_BAD_TRANSITION_MATRIX                               -55
+#define MSP_ERR_BAD_SLIM_PARAMETERS                                 -57
+#define MSP_ERR_MUTATION_ID_OVERFLOW                                -58
+#define MSP_ERR_BREAKPOINT_MASS_NON_FINITE                          -59
+#define MSP_ERR_BREAKPOINT_RESAMPLE_OVERFLOW                        -60
+#define MSP_ERR_TRACKLEN_RESAMPLE_OVERFLOW                          -61
+#define MSP_ERR_FENWICK_REBUILD_FAILED                              -62
+#define MSP_ERR_BAD_PLOIDY                                          -63
+#define MSP_ERR_DTWF_MIGRATION_MATRIX_NOT_STOCHASTIC                -64
+#define MSP_ERR_DTWF_GC_NOT_SUPPORTED                               -65
+#define MSP_ERR_SWEEPS_GC_NOT_SUPPORTED                             -66
+#define MSP_ERR_BAD_SEQUENCE_LENGTH                                 -67
+#define MSP_ERR_ZERO_POPULATIONS                                    -68
+#define MSP_ERR_BAD_ANCIENT_SAMPLE_NODE                             -69
+#define MSP_ERR_UNKNOWN_TIME_NOT_SUPPORTED                          -70
+#define MSP_ERR_DTWF_DIPLOID_ONLY                                   -71
+
 /* clang-format on */
 /* This bit is 0 for any errors originating from tskit */
 #define MSP_TSK_ERR_BIT 13
@@ -105,5 +123,7 @@ void __msp_safe_free(void **ptr);
 
 size_t msp_binary_interval_search(double query, const double *values, size_t n_values);
 bool doubles_almost_equal(double a, double b, double eps);
+
+size_t probability_list_select(double u, size_t num_probs, double const *probs);
 
 #endif /*__UTIL_H__*/

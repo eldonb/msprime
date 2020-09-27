@@ -21,7 +21,6 @@ Command line interfaces to the msprime library.
 """
 import argparse
 import hashlib
-import json
 import os
 import random
 import signal
@@ -29,9 +28,9 @@ import sys
 
 import tskit
 
-import _msprime
 import msprime
-from . import mutations
+from . import _msprime
+from . import ancestry
 
 
 def set_sigpipe_handler():
@@ -102,6 +101,26 @@ def add_precision_argument(parser):
     )
 
 
+def add_mutation_rate_argument(parser):
+    parser.add_argument(
+        "--mutation-rate",
+        "-u",
+        type=float,
+        default=0,
+        help="The mutation rate per base per generation",
+    )
+
+
+def add_random_seed_argument(parser):
+    parser.add_argument(
+        "--random-seed",
+        "-s",
+        type=int,
+        default=None,
+        help="The random seed. If not specified one is chosen randomly",
+    )
+
+
 def generate_seeds():
     """
     Generate seeds to seed the RNG and output on the command line.
@@ -164,7 +183,7 @@ def hotspots_to_recomb_map(hotspots, background_rate, seq_length):
         positions.append(seq_length)
         rates.append(0)
 
-    return msprime.RecombinationMap(positions, rates, discrete=True)
+    return msprime.RecombinationMap(positions, rates)
 
 
 class SimulationRunner:
@@ -197,12 +216,20 @@ class SimulationRunner:
         # For strict ms-compability we want to have m non-recombining loci
         if hotspots is None:
             self._recomb_map = msprime.RecombinationMap.uniform_map(
-                num_loci, self._recombination_rate, discrete=True
+                num_loci, self._recombination_rate
             )
         else:
             self._recomb_map = hotspots_to_recomb_map(
                 hotspots, self._recombination_rate, num_loci
             )
+
+        # sort out the random seeds
+        ms_seeds = random_seeds
+        if random_seeds is None:
+            ms_seeds = generate_seeds()
+        seed = get_single_seed(ms_seeds)
+        self._random_generator = _msprime.RandomGenerator(seed)
+        self._ms_random_seeds = ms_seeds
 
         # If we have specified any population_configurations we don't want
         # to give the overall sample size.
@@ -212,7 +239,7 @@ class SimulationRunner:
         # msprime measure's time in units of generations, given a specific
         # Ne value whereas ms uses coalescent time. To be compatible with ms,
         # we therefore need to use an Ne value of 1/4.
-        self._simulator = msprime.simulator_factory(
+        self._simulator = ancestry._parse_simulate(
             Ne=0.25,
             sample_size=sample_size,
             recombination_map=self._recomb_map,
@@ -221,21 +248,12 @@ class SimulationRunner:
             demographic_events=demographic_events,
             gene_conversion_rate=scaled_gene_conversion_rate,
             gene_conversion_track_length=gene_conversion_track_length,
+            random_generator=self._random_generator,
+            discrete_genome=True,
         )
 
         self._precision = precision
         self._print_trees = print_trees
-        # sort out the random seeds
-        ms_seeds = random_seeds
-        if random_seeds is None:
-            ms_seeds = generate_seeds()
-        seed = get_single_seed(ms_seeds)
-        self._random_generator = _msprime.RandomGenerator(seed)
-        self._ms_random_seeds = ms_seeds
-        self._simulator.random_generator = self._random_generator
-        self._mutation_generator = mutations._simple_mutation_generator(
-            self._mutation_rate, self._simulator.sequence_length, self._random_generator
-        )
 
     def get_num_replicates(self):
         """
@@ -296,21 +314,29 @@ class SimulationRunner:
         # The first line of ms's output is the command line.
         print(" ".join(sys.argv), file=output)
         print(" ".join(str(s) for s in self._ms_random_seeds), file=output)
-        for _ in range(self._num_replicates):
-            self._simulator.run()
-            tree_sequence = self._simulator.get_tree_sequence(self._mutation_generator)
+        for ts in self._simulator.run_replicates(self._num_replicates):
+            # This is a hack. We should have some sort of "mutator" argument
+            # to run_replicates that passes in various args or something
+            seed = 1 + self._simulator.random_generator.uniform_int(2 ** 31 - 2)
+            ts = msprime.mutate(
+                ts,
+                self._mutation_rate,
+                model=msprime.BinaryMutationModel(),
+                random_seed=seed,
+            )
             print(file=output)
             print("//", file=output)
             if self._print_trees:
-                self.print_trees(tree_sequence, output)
+                self.print_trees(ts, output)
             if self._mutation_rate > 0:
-                s = tree_sequence.get_num_mutations()
+                assert ts.num_sites == ts.num_mutations
+                s = ts.num_sites
                 print("segsites:", s, file=output)
                 if s != 0:
                     print("positions: ", end="", file=output)
                     positions = [
                         mutation.position / self._num_loci
-                        for mutation in tree_sequence.mutations()
+                        for mutation in ts.mutations()
                     ]
                     positions.sort()
                     for position in positions:
@@ -320,11 +346,10 @@ class SimulationRunner:
                             file=output,
                         )
                     print(file=output)
-                    for h in tree_sequence.haplotypes():
+                    for h in ts.haplotypes():
                         print(h, file=output)
                 else:
                     print(file=output)
-            self._simulator.reset()
 
 
 def convert_int(value, parser):
@@ -434,8 +459,10 @@ def create_simulation_runner(parser, arg_list):
     # ms uses a ratio to define the GC rate, but if the recombination rate
     # is zero we define the gc rate directly.
     gc_param, gc_track_length = args.gene_conversion
+    gc_rate = 0
     if r == 0.0:
-        gc_rate = gc_param
+        if num_loci > 1:
+            gc_rate = gc_param / (num_loci - 1)
     else:
         gc_rate = r * gc_param
 
@@ -1014,102 +1041,6 @@ def mspms_main(arg_list=None):
 #######################################################
 
 
-def exit(message):  # noqa: A001
-    sys.exit(message)
-
-
-def run_upgrade(args):
-    try:
-        tree_sequence = tskit.load_legacy(args.source, args.remove_duplicate_positions)
-    except tskit.DuplicatePositionsError:
-        exit(
-            "Error: Duplicate mutation positions in the source file detected.\n\n"
-            'This is not supported in the current file format. Running "upgrade -d" '
-            "will remove these duplicate positions. However, this will result in loss "
-            "of data from the original file!"
-        )
-    tree_sequence.dump(args.destination)
-
-
-def run_dump_newick(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    for tree in tree_sequence.trees():
-        newick = tree.newick(precision=args.precision)
-        print(newick)
-
-
-def run_dump_haplotypes(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    for h in tree_sequence.haplotypes():
-        print(h)
-
-
-def run_dump_variants(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    for variant in tree_sequence.variants(as_bytes=True):
-        print(variant.position, end="\t")
-        print(f"{variant.genotypes.decode()}")
-
-
-def run_dump_nodes(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence.dump_text(nodes=sys.stdout, precision=args.precision)
-
-
-def run_dump_edges(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence.dump_text(edges=sys.stdout, precision=args.precision)
-
-
-def run_dump_sites(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence.dump_text(sites=sys.stdout, precision=args.precision)
-
-
-def run_dump_mutations(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence.dump_text(mutations=sys.stdout, precision=args.precision)
-
-
-def run_dump_provenances(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    if args.human:
-        for provenance in tree_sequence.provenances():
-            d = json.loads(provenance.record)
-            print(
-                "id={}, timestamp={}, record={}".format(
-                    provenance.id, provenance.timestamp, json.dumps(d, indent=4)
-                )
-            )
-    else:
-        tree_sequence.dump_text(provenances=sys.stdout)
-
-
-def run_dump_vcf(args):
-    tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence.write_vcf(sys.stdout, args.ploidy)
-
-
-def run_dump_macs(args):
-    """
-    Write a macs formatted file so we can import into pbwt.
-    """
-    tree_sequence = tskit.load(args.tree_sequence)
-    n = tree_sequence.get_sample_size()
-    m = tree_sequence.get_sequence_length()
-    print(f"COMMAND:\tnot_macs {n} {m}")
-    print("SEED:\tASEED")
-    for variant in tree_sequence.variants(as_bytes=True):
-        print(
-            "SITE:",
-            variant.index,
-            variant.position / m,
-            0.0,
-            f"{variant.genotypes.decode()}",
-            sep="\t",
-        )
-
-
 def run_simulate(args):
     tree_sequence = msprime.simulate(
         sample_size=int(args.sample_size),
@@ -1122,6 +1053,20 @@ def run_simulate(args):
     tree_sequence.dump(args.tree_sequence, zlib_compression=args.compress)
 
 
+def run_mutate(args):
+    tree_sequence = tskit.load(args.tree_sequence)
+    tree_sequence = msprime.mutate(
+        tree_sequence=tree_sequence,
+        rate=args.mutation_rate,
+        random_seed=args.random_seed,
+        keep=args.keep,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        discrete=args.discrete,
+    )
+    tree_sequence.dump(args.output_tree_sequence)
+
+
 def get_msp_parser():
     top_parser = argparse.ArgumentParser(
         description="Command line interface for msprime.", epilog=msprime_citation_text
@@ -1132,6 +1077,50 @@ def get_msp_parser():
     subparsers = top_parser.add_subparsers(dest="subcommand")
     subparsers.required = True
 
+    add_simulate_subcommand(subparsers)
+    add_mutate_subcommand(subparsers)
+
+    return top_parser
+
+
+def add_mutate_subcommand(subparsers):
+    parser = subparsers.add_parser("mutate", help="Add mutations to a tree sequence.")
+    add_tree_sequence_argument(parser)
+    add_mutation_rate_argument(parser)
+    add_random_seed_argument(parser)
+    parser.add_argument(
+        "output_tree_sequence",
+        help="The tree sequence output file containing the new mutations",
+    )
+    parser.add_argument(
+        "--keep",
+        "-k",
+        action="store_true",
+        default=False,
+        help="Keep mutations in input tree sequence",
+    )
+    parser.add_argument(
+        "--discrete",
+        action="store_true",
+        default=False,
+        help="Generate mutations at only integer positions along the genome. ",
+    )
+    parser.add_argument(
+        "--start-time",
+        type=float,
+        default=None,
+        help="The minimum time ago at which a mutation can occur.",
+    )
+    parser.add_argument(
+        "--end-time",
+        type=float,
+        default=None,
+        help="The maximum time ago at which a mutation can occur.",
+    )
+    parser.set_defaults(runner=run_mutate)
+
+
+def add_simulate_subcommand(subparsers) -> None:
     parser = subparsers.add_parser("simulate", help="Run the simulation")
     add_sample_size_argument(parser)
     add_tree_sequence_argument(parser)
@@ -1149,13 +1138,7 @@ def get_msp_parser():
         default=0,
         help="The recombination rate per base per generation",
     )
-    parser.add_argument(
-        "--mutation-rate",
-        "-u",
-        type=float,
-        default=0,
-        help="The mutation rate per base per generation",
-    )
+    add_mutation_rate_argument(parser)
     parser.add_argument(
         "--effective-population-size",
         "-N",
@@ -1163,101 +1146,11 @@ def get_msp_parser():
         default=1,
         help="The diploid effective population size Ne",
     )
-    parser.add_argument(
-        "--random-seed",
-        "-s",
-        type=int,
-        default=None,
-        help="The random seed. If not specified one is chosen randomly",
-    )
+    add_random_seed_argument(parser)
     parser.add_argument(
         "--compress", "-z", action="store_true", help="Enable zlib compression"
     )
     parser.set_defaults(runner=run_simulate)
-
-    parser = subparsers.add_parser(
-        "vcf", help="Write the tree sequence out in VCF format."
-    )
-    add_tree_sequence_argument(parser)
-    parser.add_argument(
-        "--ploidy", "-P", type=int, default=1, help="The ploidy level of samples"
-    )
-    parser.set_defaults(runner=run_dump_vcf)
-
-    parser = subparsers.add_parser("nodes", help="Dump nodes in tabular format.")
-    add_tree_sequence_argument(parser)
-    add_precision_argument(parser)
-    parser.set_defaults(runner=run_dump_nodes)
-
-    parser = subparsers.add_parser("edges", help="Dump edges in tabular format.")
-    add_tree_sequence_argument(parser)
-    add_precision_argument(parser)
-    parser.set_defaults(runner=run_dump_edges)
-
-    parser = subparsers.add_parser("sites", help="Dump sites in tabular format.")
-    add_tree_sequence_argument(parser)
-    add_precision_argument(parser)
-    parser.set_defaults(runner=run_dump_sites)
-
-    parser = subparsers.add_parser(
-        "mutations", help="Dump mutations in tabular format."
-    )
-    add_tree_sequence_argument(parser)
-    add_precision_argument(parser)
-    parser.set_defaults(runner=run_dump_mutations)
-
-    parser = subparsers.add_parser(
-        "provenances", help="Dump provenance information in tabular format."
-    )
-    add_tree_sequence_argument(parser)
-    parser.add_argument(
-        "-H",
-        "--human",
-        action="store_true",
-        help="Print out the provenances in a human readable format",
-    )
-    parser.set_defaults(runner=run_dump_provenances)
-
-    parser = subparsers.add_parser("haplotypes", help="Dump haplotypes in text format.")
-    add_tree_sequence_argument(parser)
-    parser.set_defaults(runner=run_dump_haplotypes)
-
-    parser = subparsers.add_parser("variants", help="Dump variants in text format.")
-    add_tree_sequence_argument(parser)
-    parser.set_defaults(runner=run_dump_variants)
-
-    parser = subparsers.add_parser("macs", help="Dump results in MaCS format.")
-    add_tree_sequence_argument(parser)
-    parser.set_defaults(runner=run_dump_macs)
-
-    parser = subparsers.add_parser("newick", help="Dump results in newick format.")
-    add_tree_sequence_argument(parser)
-    parser.add_argument(
-        "--precision",
-        "-p",
-        type=int,
-        default=3,
-        help="The number of decimal places in branch lengths",
-    )
-    parser.set_defaults(runner=run_dump_newick)
-
-    parser = subparsers.add_parser(
-        "upgrade", help="Upgrade legacy tree sequence files to the latest version."
-    )
-    parser.add_argument(
-        "source", help="The source msprime tree sequence file in legacy format"
-    )
-    parser.add_argument("destination", help="The filename of the upgraded copy.")
-    parser.add_argument(
-        "--remove-duplicate-positions",
-        "-d",
-        action="store_true",
-        default=False,
-        help="Remove any duplicated mutation positions in the source file. ",
-    )
-    parser.set_defaults(runner=run_upgrade)
-
-    return top_parser
 
 
 def msp_main(arg_list=None):

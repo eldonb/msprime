@@ -214,7 +214,7 @@ Meson is best installed via ``pip``:
 
     $ python3 -m pip install meson --user
 
-On macOS rather than use ``apt-get`` for installation of these requirements 
+On macOS rather than use ``apt-get`` for installation of these requirements
 a combination of ``homebrew`` and ``pip`` can be used (working as of 2020-01-15).
 
 .. code-block:: bash
@@ -230,7 +230,7 @@ directory, run
 
 .. code-block:: bash
 
-    $ cd lib 
+    $ cd lib
     $ meson build
 
 On macOS, conda builds are generally done using ``clang`` packages that are kept up to date:
@@ -254,7 +254,7 @@ On more recent macOS releases, you may omit the ``CONDA_BUILD_SYSROOT`` prefix.
    The use of the C toolchain on macOS is a moving target.  The above advice
    was written on 23 January, 2020 and was validated by a few ``msprime`` contributors.
    Caveat emptor, etc..
-      
+
 To compile the code, ``cd`` into the ``build`` directory and run ``ninja``. All the
 compiled binaries are then in the ``build`` directory:
 
@@ -345,6 +345,26 @@ While 100% test coverage is not feasible for C code, we aim to cover all code
 that can be reached. (Some classes of error such as malloc failures
 and IO errors are difficult to simulate in C.) Code coverage statistics are
 automatically tracked using `CodeCov <https://codecov.io/gh/tskit-dev/msprime/>`_.
+
+++++++++++
+Code Style
+++++++++++
+
+C code is formatted using
+`clang-format <https://clang.llvm.org/docs/ClangFormat.html>`_
+with a custom configuration.
+To ensure that your code is correctly formatted, you can run
+
+.. code-block:: bash
+
+   clang-format -i lib/tests/* lib/!(avl).{c,h}
+
+before submitting a pull request.
+
+Vim users may find the
+`vim-clang-format <https://github.com/rhysd/vim-clang-format>`_
+plugin useful for automatically formatting code.
+
 
 ++++++++++++++++++
 Coding conventions
@@ -533,124 +553,62 @@ running the statistical tests, and can be built by running ``make`` in the
 like ``ms`` and ``ms_summary_stats`` present in the ``data``
 directory.
 
-The ``verification.py`` script contains lots of different tests, each one
-identified by a particular "key". To run all the tests, run the script without
-any arguments. To run some specific tests, provide the required keys as command
-line arguments.
+Please the comments at the top of the ``verification.py`` script for details
+on how to write and run these tests.
 
-Many of the tests involve creating an ``ms`` command line, running it
-with ``ms`` and ``msprime`` and comparing the statistical properties of the
-results. The output of each test is a series of plots, written to a directory
-named after the test key. For example, results for the ``admixture-1-pop2`` test are
-written in the ``tmp__NOBACKUP__/admixture-1-pop2/`` directory (the prefix is
-not important here and can be changed). The majority of the results are
-QQ-plots of the statistics in question comparing ``ms`` and ``msprime``.
 
-There are also several "analytical" tests, which compare the distributions of
-values from ``msprime`` with analytical expectations.
+************
+Benchmarking
+************
+
+Benchmarks to measure performance are in the ``benchmarks`` folder and are run using
+`airspeed velocity <https://asv.readthedocs.io/en/stable/index.html>`_. 
+An automated system runs the benchmarks on each push to the main branch and uploads
+the results to `this github pages site` <https://tskit-dev.github.io/msprime-asv>_.
+These benchmarks can also be run locally to compare your branch with the master branch.
+Your changes must be in a commit to be measured. To run the benchmarks::
+
+    asv run asv run HEAD...main~1
+
+This will run the benchmarks for the latest main branch commit and all commits on
+your current branch (the syntax for choosing commits is the same as ``git log``).
+The following commands then make a browsable report (link given in output of
+the command)::
+
+    asv publish
+    asv preview
+
+Note the following tips:
+
+- Specifying the range of commits to run uses the same syntax as git log.
+  For example, to run for a single commit, use ``asv run 88fbbc33^!``
+
+- GOTCHA! Be careful when running ``asv dev`` or using ``python=same`` as
+  this can use the *installed* version of msprime rather than the local
+  development version. This can lead to confusing results! When tuning
+  benchmarks it's better to commit often and use (e.g.)
+  ``asv run HEAD^! --show-stderr -b Hudson.time_large_sample_size``.
+
 
 ****************
 Containerization
 ****************
 
-This repo is integrated with `Dockerhub <https://hub.docker.com/r/tskit/msprime>`__ and the Docker image will be automatically
-built upon each release on GitHub. Each Docker image is `tagged <https://hub.docker.com/r/tskit/msprime/tags>`__ with the corresponding release.
+To run msprime in a container, see the
+:ref:`installation instructions as Linux container <sec_linux_container>`.
 
-Enter a Docker container from Dockerhub:
-
-.. code-block:: bash
-
-    $ sudo docker run -it tskit/msprime:<release>
-
-For example, if we want to use msprime release 0.7.3, we would use the corresponding Docker image tag (``tskit/msprime:0.7.3``)
-
-msprime can also be executed via the Docker container:
-
-.. code-block:: bash
-
-    $ sudo docker run -it tskit/msprime:<release> mspms 10 1 -T
-
-A Docker image can also be locally built:
+You can use ``docker`` to locally build an image, but it requires root access:
 
 .. code-block:: bash
 
     $ sudo docker build -t tskit/msprime .
 
-
-Building Docker images and running Docker containers requires root access.
-If you are on a system and do not have root access, you can pull the Docker image
-and run it as a Singularity container.
-
-To run as a Singularity container, pull the docker image:
+`podman <https://podman.io/>`_ can build and run images without root privilege.
 
 .. code-block:: bash
 
-    $ singularity pull docker://tskit/msprime:<release> msprime-<release>.simg
+    $ podman build -t tskit/msprime .
 
-Enter Singularity container container:
-
-.. code-block:: bash
-
-    $ singularity shell msprime-<release>.simg
-
-Or, msprime can be executed via the Singularity container:
-
-.. code-block:: bash
-
-    $ singularity exec msprime-<release>.simg mspms 10 1 -T
-
-It is possible that your current environment may conflict with the environment in the singularity container.
-There are two workarounds:
-
-1.  Ignore your home with the conflicting environment with ``--contain`` or ``-H </new/path/to/home> -e``
-
-.. code-block:: bash
-
-    $ singularity shell --contain msprime-release-0.7.3.simg
-    Singularity: Invoking an interactive shell within container...
-
-    Singularity msprime-release-0.7.3.simg:~> python3
-    Python 3.6.8 (default, Jan 14 2019, 11:02:34)
-    [GCC 8.0.1 20180414 (experimental) [trunk revision 259383]] on linux
-    Type "help", "copyright", "credits" or "license" for more information.
-    >>> import msprime
-    >>>
-
-or use a different path as your home that does not have a conflicting environment
-
-.. code-block:: bash
-
-    $ singularity shell -H </new/path/to/home> -e msprime-release-0.7.3.simg
-    Singularity: Invoking an interactive shell within container...
-
-    Singularity msprime-release-0.7.3.simg:~/cnn_classify_demography> python3
-    Python 3.6.8 (default, Jan 14 2019, 11:02:34)
-    [GCC 8.0.1 20180414 (experimental) [trunk revision 259383]] on linux
-    Type "help", "copyright", "credits" or "license" for more information.
-    >>> import msprime
-    >>>
-
-2. In python get rid of your local path
-
-.. code-block:: bash
-
-    $ singularity shell msprime-release-0.7.3.simg
-    Singularity: Invoking an interactive shell within container...
-
-    Singularity msprime-release-0.7.3.simg:~> python3
-    Python 3.6.8 (default, Jan 14 2019, 11:02:34)
-    [GCC 8.0.1 20180414 (experimental) [trunk revision 259383]] on linux
-    Type "help", "copyright", "credits" or "license" for more information.
-    >>> import sys
-    >>> for _path in sys.path:
-    ...     if ".local" in _path:
-    ...             sys.path.remove(_path)
-    ...
-    >>> import msprime
-    >>>
-
-
-For more information on Singularity, see https://www.sylabs.io/guides/3.0/user-guide/
 
 *************
 Documentation
