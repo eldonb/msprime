@@ -24,7 +24,7 @@ jobs:
           command: |
             sudo apt-get update
             sudo apt-get install libgsl0-dev libcunit1-dev libconfig-dev ninja-build valgrind clang
-            pip install --user -r requirements/development.txt
+            pip install --user -r requirements/CI-complete/requirements.txt
             pip install --user meson twine
             # way to set path persistently https://circleci.com/docs/2.0/env-vars/#setting-path
             echo 'export PATH=/home/circleci/.local/bin:$PATH' >> $BASH_ENV
@@ -32,18 +32,6 @@ jobs:
           key: msprime-{{ .Branch }}-v1
           paths:
             - "/home/circleci/.local"
-
-      - run:
-          name: Lint Python (pre-commit)
-          command: |
-            pre-commit run --all-files --show-diff-on-failure
-
-      # Note: it's important that we build the docs *before* compiling the low-level
-      # module so that we're simulating the build on readthedocs as accurately as
-      # possible.
-      - run:
-          name: Make sure the docs build.
-          command: make -C docs
 
       - run:
           name: Compile Python
@@ -79,10 +67,10 @@ jobs:
             gcov -pb ./libmsprime.a.p/msprime.c.gcno ../lib/msprime.c
             gcov -pb ./libmsprime.a.p/mutgen.c.gcno ../lib/mutgen.c
             gcov -pb ./libmsprime.a.p/object_heap.c.gcno ../lib/object_heap.c
-            gcov -pb ./libmsprime.a.p/recomb_map.c.gcno ../lib/recomb_map.c
             gcov -pb ./libmsprime.a.p/interval_map.c.gcno ../lib/interval_map.c
             gcov -pb ./libmsprime.a.p/util.c.gcno ../lib/util.c
             gcov -pb ./libmsprime.a.p/likelihood.c.gcno ../lib/likelihood.c
+            gcov -pb ./libmsprime.a.p/rate_map.c.gcno ../lib/rate_map.c
             cd ..
             codecov -X gcov -F C
 

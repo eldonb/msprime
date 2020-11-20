@@ -271,10 +271,7 @@ def _parse_simulate(
     sample_size=None,
     *,
     Ne=1,
-    random_generator=None,
-    random_seed=None,
     length=None,
-    discrete_genome=None,
     recombination_rate=None,
     recombination_map=None,
     population_configurations=None,
@@ -289,10 +286,8 @@ def _parse_simulate(
     end_time=None,
     record_full_arg=False,
     num_labels=None,
-    gene_conversion_rate=None,
-    gene_conversion_track_length=None,
     demography=None,
-    ploidy=None,
+    random_seed=None,
 ):
     """
     Argument parser for the simulate frontend. Interprets all the parameters
@@ -350,9 +345,6 @@ def _parse_simulate(
                 "equal to the number of populations in from_ts"
             )
 
-    if discrete_genome is None:
-        discrete_genome = False
-
     if recombination_map is None:
         # Default to 1 if no from_ts; otherwise default to the sequence length
         # of from_ts
@@ -365,11 +357,6 @@ def _parse_simulate(
             raise ValueError("Cannot provide non-positive sequence length")
         if the_rate < 0:
             raise ValueError("Cannot provide negative recombination rate")
-        if discrete_genome and length != math.floor(length):
-            raise ValueError(
-                "Cannot specify non-integer sequence length when discrete_genome "
-                "is True"
-            )
         recombination_map = intervals.RateMap.uniform(the_length, the_rate)
     else:
         if isinstance(recombination_map, intervals.RecombinationMap):
@@ -391,53 +378,28 @@ def _parse_simulate(
     if num_labels is not None and num_labels < 1:
         raise ValueError("Must have at least one structured coalescent label")
 
-    # TODO should we allow a rate map in the same way as sim_ancestry?
-    if gene_conversion_rate is None:
-        gene_conversion_rate = 0
-    else:
-        if not discrete_genome:
-            raise ValueError(
-                "Cannot specify gene_conversion_rate along with "
-                "a non discrete genome."
-            )
-    if gene_conversion_track_length is None:
-        gene_conversion_track_length = 1
-    gene_conversion_map = intervals.RateMap.uniform(
-        recombination_map.sequence_length, gene_conversion_rate
-    )
-
-    # For the simulate code-path the rng will already be set, but
-    # for convenience we allow it to be null to help with writing
-    # tests. We also provide the random_seed argument for convenience.
-    if random_seed is not None:
-        if random_generator is not None:
-            raise ValueError("Cannot specify both random_seed and random_generator")
-        random_generator = _msprime.RandomGenerator(random_seed)
-    if random_generator is None:
-        random_generator = _msprime.RandomGenerator(core.get_random_seed())
-
-    if ploidy is None:
-        ploidy = 2
-
     if from_ts is None:
         tables = _build_initial_tables(
             sequence_length=recombination_map.sequence_length,
             samples=samples,
-            ploidy=ploidy,
+            # FIXME not clear how this is all working now. We shouldn't have
+            # the pedigree as a parameter here at all which would probably
+            # simplify things.
+            ploidy=2,
             demography=demography,
             pedigree=pedigree,
         )
     else:
         tables = from_ts.tables
 
+    # It's useful to call _parse_simulate outside the context of the main
+    # entry point - so we want to get good seeds in this case too.
+    random_seed = _parse_random_seed(random_seed)
+    random_generator = _msprime.RandomGenerator(random_seed)
+
     sim = Simulator(
         tables=tables,
         recombination_map=recombination_map,
-        gene_conversion_map=gene_conversion_map,
-        gene_conversion_track_length=gene_conversion_track_length,
-        discrete_genome=discrete_genome,
-        ploidy=ploidy,
-        random_generator=random_generator,
         model=model,
         store_migrations=record_migrations,
         store_full_arg=record_full_arg,
@@ -446,19 +408,44 @@ def _parse_simulate(
         num_labels=num_labels,
         demography=demography,
         model_change_events=model_change_events,
+        # Defaults for the values that are not supported through simulate()
+        gene_conversion_map=intervals.RateMap.uniform(
+            recombination_map.sequence_length, 0
+        ),
+        gene_conversion_tract_length=0,
+        discrete_genome=False,
+        ploidy=2,
+        random_generator=random_generator,
     )
     return sim
 
 
 def _parse_random_seed(seed):
     """
-    Parse the specified random seed value and return a RandomGenerator
-    object. If no seed is provided, generate a high-quality random seed.
+    Parse the specified random seed value. If no seed is provided, generate a
+    high-quality random seed.
     """
     if seed is None:
         seed = core.get_random_seed()
     seed = int(seed)
-    return _msprime.RandomGenerator(seed)
+    return seed
+
+
+def _parse_replicate_index(*, replicate_index, random_seed, num_replicates):
+    """
+    Parse the replicate_index value, and ensure that its value makes sense
+    in the context of the other parameters.
+    """
+    if replicate_index is None:
+        return None
+    if random_seed is None:
+        raise ValueError("Cannot specify the replicate_index without a random_seed")
+    if num_replicates is not None:
+        raise ValueError("Cannot specify the replicate_index as well as num_replicates")
+    replicate_index = int(replicate_index)
+    if replicate_index < 0:
+        raise ValueError("Cannot specify negative replicate_index.")
+    return replicate_index
 
 
 def _build_provenance(command, random_seed, frame):
@@ -488,7 +475,6 @@ def simulate(
     *,
     Ne=1,
     length=None,
-    discrete_genome=None,
     recombination_rate=None,
     recombination_map=None,
     mutation_rate=None,
@@ -500,18 +486,15 @@ def simulate(
     model=None,
     record_migrations=False,
     random_seed=None,
+    replicate_index=None,
     mutation_generator=None,
     num_replicates=None,
-    replicate_index=None,
     from_ts=None,
     start_time=None,
     end_time=None,
     record_full_arg=False,
     num_labels=None,
     record_provenance=True,
-    # FIXME add documentation for these.
-    gene_conversion_rate=None,
-    gene_conversion_track_length=None,
     demography=None,
 ):
     """
@@ -532,17 +515,6 @@ def simulate(
     :param float length: The length of the simulated region in bases.
         This parameter cannot be used along with ``recombination_map``.
         Defaults to 1 if not specified.
-    :param bool discrete_genome: If True, use discrete coordinates
-        in simulations such that recombination breakpoints and mutational
-        sites can only occur at integer positions along the genome.
-        Multiple mutations can occur at the same site.
-        If False (the default) the recombination breakpoints and
-        coordinates of mutational sites are continuous floating point values.
-        All sites in the returned tree sequence will have exactly one mutation.
-        Please see the :func:`.mutate` function for a more powerful approach to
-        simulating mutations on a tree sequence. It is an error to specify
-        the ``discrete_genome`` parameter at the same time as the
-        ``recombination_map`` argument.
     :param float recombination_rate: The rate of recombination per base
         per generation. This parameter cannot be used along with
         ``recombination_map``. Defaults to 0 if not specified.
@@ -600,11 +572,6 @@ def simulate(
         returned. If :obj:`num_replicates` is provided, the specified
         number of replicates is performed, and an iterator over the
         resulting :class:`tskit.TreeSequence` objects returned.
-    :param int replicate_index: Return only a specific tree
-        sequence from the set of replicates. This is used to recreate a specific tree
-        sequence from e.g. provenance. This argument only makes sense when used with
-        `random seed`, and is not compatible with `num_replicates`. Note also that
-        msprime will have to create and discard all the tree sequences up to this index.
     :param tskit.TreeSequence from_ts: If specified, initialise the simulation
         from the root segments of this tree sequence and return the
         completed tree sequence. Please see :ref:`here
@@ -642,16 +609,17 @@ def simulate(
         :obj:`num_replicates` parameter has been used.
     :rtype: :class:`tskit.TreeSequence` or an iterator over
         :class:`tskit.TreeSequence` replicates.
-    :warning: If using replication, do not store the results of the
-        iterator in a list! For performance reasons, the same
-        underlying object may be used for every TreeSequence
-        returned which will most likely lead to unexpected behaviour.
     """
-    rng = _parse_random_seed(random_seed)
+    replicate_index = _parse_replicate_index(
+        random_seed=random_seed,
+        num_replicates=num_replicates,
+        replicate_index=replicate_index,
+    )
+    random_seed = _parse_random_seed(random_seed)
     provenance_dict = None
     if record_provenance:
         frame = inspect.currentframe()
-        provenance_dict = _build_provenance("simulate", rng.seed, frame)
+        provenance_dict = _build_provenance("simulate", random_seed, frame)
 
     if mutation_generator is not None:
         # This error was added in version 0.6.1.
@@ -686,10 +654,8 @@ def simulate(
 
     sim = _parse_simulate(
         sample_size=sample_size,
-        random_generator=rng,
         Ne=Ne,
         length=length,
-        discrete_genome=discrete_genome,
         recombination_rate=recombination_rate,
         recombination_map=recombination_map,
         population_configurations=population_configurations,
@@ -704,16 +670,13 @@ def simulate(
         end_time=end_time,
         record_full_arg=record_full_arg,
         num_labels=num_labels,
-        gene_conversion_rate=gene_conversion_rate,
-        gene_conversion_track_length=gene_conversion_track_length,
         demography=demography,
+        random_seed=random_seed,
     )
-
     return _wrap_replicates(
         sim,
-        random_seed=random_seed,
-        replicate_index=replicate_index,
         num_replicates=num_replicates,
+        replicate_index=replicate_index,
         provenance_dict=provenance_dict,
         mutation_rate=mutation_rate,
     )
@@ -722,9 +685,8 @@ def simulate(
 def _wrap_replicates(
     simulator,
     *,
-    random_seed,
-    replicate_index,
     num_replicates,
+    replicate_index,
     provenance_dict,
     mutation_rate=None,
 ):
@@ -732,30 +694,17 @@ def _wrap_replicates(
     Wrapper for the logic used to run replicate simulations for the two
     frontends.
     """
-
-    if replicate_index is not None and random_seed is None:
-        raise ValueError(
-            "Cannot specify replicate_index without random_seed as this "
-            "has the same effect as not specifying replicate_index i.e. a "
-            "random tree sequence"
-        )
-    if replicate_index is not None and num_replicates is not None:
-        raise ValueError(
-            "Cannot specify replicate_index with num_replicates as only "
-            "the replicate_index specified will be returned."
-        )
     if num_replicates is None and replicate_index is None:
-        # This is the default case where we just return one replicate.
+        # Default single-replicate case.
         replicate_index = 0
-        num_replicates = 1
     if replicate_index is not None:
         num_replicates = replicate_index + 1
-
     iterator = simulator.run_replicates(
-        num_replicates, mutation_rate=mutation_rate, provenance_dict=provenance_dict
+        num_replicates,
+        mutation_rate=mutation_rate,
+        provenance_dict=provenance_dict,
     )
     if replicate_index is not None:
-        # Return the last element of the iterator
         deque = collections.deque(iterator, maxlen=1)
         return deque.pop()
     else:
@@ -885,7 +834,7 @@ def _parse_sim_ancestry(
     sequence_length=None,
     recombination_rate=None,
     gene_conversion_rate=None,
-    gene_conversion_track_length=None,
+    gene_conversion_tract_length=None,
     discrete_genome=None,
     population_size=None,
     demography=None,
@@ -898,9 +847,6 @@ def _parse_sim_ancestry(
     record_full_arg=None,
     num_labels=None,
     random_seed=None,
-    random_generator=None,
-    num_replicates=None,
-    replicate_index=None,
 ):
     """
     Argument parser for the sim_ancestry frontend. Interprets all the parameters
@@ -958,21 +904,21 @@ def _parse_sim_ancestry(
     gene_conversion_map = _parse_rate_map(
         gene_conversion_rate, sequence_length, "gene conversion"
     )
-    if gene_conversion_track_length is None:
+    if gene_conversion_tract_length is None:
         if gene_conversion_rate is None:
-            # It doesn't matter what the track_length is, just set a
+            # It doesn't matter what the tract_length is, just set a
             # value to keep the low-level code happy.
-            gene_conversion_track_length = 1
+            gene_conversion_tract_length = 1
         else:
             raise ValueError(
-                "Must specify track length when simulating gene conversion"
+                "Must specify tract length when simulating gene conversion"
             )
     else:
         if gene_conversion_rate is None:
             raise ValueError(
-                "Must specify gene conversion rate along with track length"
+                "Must specify gene conversion rate along with tract length"
             )
-        gene_conversion_track_length = float(gene_conversion_track_length)
+        gene_conversion_tract_length = float(gene_conversion_tract_length)
 
     # Default to diploid
     ploidy = 2 if ploidy is None else ploidy
@@ -986,7 +932,8 @@ def _parse_sim_ancestry(
     is_dtwf = isinstance(model, DiscreteTimeWrightFisher)
 
     # Check the demography. If no demography is specified, we default to a
-    # single-population model with a given population size.
+    # single-population model with a given population size. If an initial
+    # state is provided, we default to using that number of populations.
     if demography is None:
         if is_dtwf:
             # A default size of 1 isn't so smart for DTWF and almost certainly
@@ -997,8 +944,11 @@ def _parse_sim_ancestry(
                     "explicitly, either using the population_size or demography "
                     "arguments."
                 )
+        num_populations = 1 if initial_state is None else len(initial_state.populations)
         population_size = 1 if population_size is None else float(population_size)
-        demography = demog.Demography.simple_model(population_size)
+        demography = demog.Demography.island_model(
+            num_populations, migration_rate=0, Ne=population_size
+        )
     elif isinstance(demography, demog.Demography):
         if population_size is not None:
             raise ValueError("Cannot specify demography and population size")
@@ -1028,20 +978,16 @@ def _parse_sim_ancestry(
                 "initial_state tables must define at least one population."
             )
 
-    # For the standard code path, random_generator should always be set. But,
-    # we can also use the parser code elsewhere, so it's useful to be able
-    # to either provide a random seed, or get a good one.
-    if random_generator is None:
-        random_generator = _parse_random_seed(random_seed)
-    elif random_seed is not None:
-        raise ValueError("Cannot specify both random seed and random generator")
+    # It's useful to call _parse_sim_ancestry outside the context of the main
+    # entry point - so we want to get good seeds in this case too.
+    random_seed = _parse_random_seed(random_seed)
+    random_generator = _msprime.RandomGenerator(random_seed)
 
     return Simulator(
         tables=initial_state,
-        random_generator=random_generator,
         recombination_map=recombination_map,
         gene_conversion_map=gene_conversion_map,
-        gene_conversion_track_length=gene_conversion_track_length,
+        gene_conversion_tract_length=gene_conversion_tract_length,
         discrete_genome=discrete_genome,
         ploidy=ploidy,
         demography=demography,
@@ -1052,6 +998,7 @@ def _parse_sim_ancestry(
         start_time=start_time,
         end_time=end_time,
         num_labels=num_labels,
+        random_generator=random_generator,
     )
 
 
@@ -1059,10 +1006,10 @@ def sim_ancestry(
     samples=None,
     *,
     sequence_length=None,
+    discrete_genome=None,
     recombination_rate=None,
     gene_conversion_rate=None,
-    gene_conversion_track_length=None,
-    discrete_genome=None,
+    gene_conversion_tract_length=None,
     population_size=None,
     demography=None,
     ploidy=None,
@@ -1078,22 +1025,113 @@ def sim_ancestry(
     replicate_index=None,
     record_provenance=None,
 ):
+    """
+    Simulates an ancestral process described by a given model, demography and
+    set of samples and return the output as a
+    :class:`tskit.TreeSequence` (or a sequence of replicate tree sequences).
 
-    random_generator = _parse_random_seed(random_seed)
+    :param samples: The sampled individuals as either an integer, specifying
+        the number of individuals to sample at time zero in a single-population
+        model; or a list of :class:`.Sample` objects explicitly specifying the
+        time and population of every sample individual. Each sampled individual
+        corresponds to :math:`k` sample *nodes* when ``ploidy`` = :math:`k`.
+        Either ``samples`` or ``initial_state`` must be specified.
+        See :ref:`sec_ancestry_samples_ploidy` for usage examples.
+    :param int ploidy: The number of monoploid genomes per sample individual
+        (Default=2). See :ref:`sec_ancestry_samples_ploidy` for usage examples.
+    :param float sequence_length: The length of the genome sequence to simulate.
+        See :ref:`sec_ancestry_genome_length` for usage examples
+        for this parameter and how it interacts with other parameters.
+    :param bool discrete_genome: If True (the default) simulation occurs
+        in discrete genome coordinates such that recombination and
+        gene conversion breakpoints always occur at integer positions.
+        Thus, multiple (e.g.) recombinations can occur at the same
+        genome position. If ``discrete_genome`` is False simulations
+        are performed using continuous genome coordinates. In this
+        case multiple events at precisely the same genome location are very
+        unlikely (but technically possible).
+        See :ref:`sec_ancestry_discrete_genome` for usage examples.
+    :param recombination_rate: The rate of recombination along the sequence;
+        can be either a single value (specifying a single rate over the entire
+        sequence) or an instance of :class:`RateMap`.
+        See :ref:`sec_ancestry_recombination` for usage examples
+        for this parameter and how it interacts with other parameters.
+    :param gene_conversion_rate: The rate of gene conversion along the sequence;
+        can be either a single value (specifying a single rate over the entire
+        sequence) or an instance of :class:`RateMap`. If provided, a value
+        for ``gene_conversion_tract_length`` must also be specified.
+        See :ref:`sec_ancestry_gene_conversion` for usage examples
+        for this parameter and how it interacts with other parameters.
+    :param gene_conversion_tract_length: TODO
+    :param int random_seed: The random seed. If this is not specified or `None`,
+        a high-quality random seed will be automatically generated. Valid random
+        seeds must be between 1 and :math:`2^{32} - 1`.
+        See :ref:`sec_ancestry_random_seed` for usage examples.
+    :param int num_replicates: The number of replicates of the specified
+        parameters to simulate. If this is not specified or `None`,
+        no replication is performed and a :class:`tskit.TreeSequence` object
+        returned. If :obj:`num_replicates` is provided, the specified
+        number of replicates is performed, and an iterator over the
+        resulting :class:`tskit.TreeSequence` objects returned.
+        See :ref:`sec_ancestry_replication` for examples.
+    :param bool record_full_arg: If True, record all intermediate nodes
+        arising from common ancestor and recombination events in the output
+        tree sequence. This will result in unary nodes (i.e., nodes in marginal
+        trees that have only one child). Defaults to False.
+        See :ref:`sec_ancestry_full_arg` for examples.
+    :param bool record_migrations: If True, record all migration events
+        that occur in the :ref:`tskit:sec_migration_table_definition` of
+        the output tree sequence. Defaults to False.
+        See :ref:`sec_ancestry_record_migrations` for examples.
+    :param tskit.TreeSequence initial_state: If specified, initialise the
+        simulation from the root segments of this tree sequence and return the
+        completed tree sequence. Please see
+        :ref:`sec_ancestry_initial_state` for details of the required
+        properties of this tree sequence and its interactions with other parameters.
+        (Default: None).
+    :param float start_time: If specified, set the initial time that the
+        simulation starts to this value. If not specified, the start
+        time is zero if performing a simulation of a set of samples,
+        or is the time of the oldest node if simulating from an
+        existing tree sequence (see the ``initial_state`` parameter).
+        See :ref:`sec_ancestry_start_time` for examples.
+    :param float end_time: If specified, terminate the simulation at the
+        specified time. In the returned tree sequence, all rootward paths from
+        samples with time < ``end_time`` will end in a node with one child with
+        time equal to end_time. Any sample nodes with time >= ``end_time`` will
+        also be present in the output tree sequence. If not specified or ``None``,
+        run the simulation until all samples have an MRCA at all positions in
+        the genome. See :ref:`sec_ancestry_end_time` for examples.
+    :param model: The simulation model to use.
+        This can either be a string (e.g., ``"smc_prime"``) or an instance of
+        a simulation model class (e.g, ``msprime.DiscreteTimeWrightFisher()``.
+        Please see the :ref:`sec_api_simulation_models` section for more details
+        on specifying simulations models.
+    :type model: str or simulation model instance
+    :return: The :class:`tskit.TreeSequence` object representing the results
+        of the simulation if no replication is performed, or an
+        iterator over the independent replicates simulated if the
+        :obj:`num_replicates` parameter has been used.
+    :rtype: :class:`tskit.TreeSequence` or an iterator over
+        :class:`tskit.TreeSequence` replicates.
+    """
     record_provenance = True if record_provenance is None else record_provenance
+    replicate_index = _parse_replicate_index(
+        random_seed=random_seed,
+        num_replicates=num_replicates,
+        replicate_index=replicate_index,
+    )
+    random_seed = _parse_random_seed(random_seed)
     provenance_dict = None
     if record_provenance:
         frame = inspect.currentframe()
-        provenance_dict = _build_provenance(
-            "sim_ancestry", random_generator.seed, frame
-        )
-
+        provenance_dict = _build_provenance("sim_ancestry", random_seed, frame)
     sim = _parse_sim_ancestry(
         samples=samples,
         sequence_length=sequence_length,
         recombination_rate=recombination_rate,
         gene_conversion_rate=gene_conversion_rate,
-        gene_conversion_track_length=gene_conversion_track_length,
+        gene_conversion_tract_length=gene_conversion_tract_length,
         discrete_genome=discrete_genome,
         population_size=population_size,
         demography=demography,
@@ -1105,13 +1143,12 @@ def sim_ancestry(
         record_migrations=record_migrations,
         record_full_arg=record_full_arg,
         num_labels=num_labels,
-        random_generator=random_generator,
+        random_seed=random_seed,
     )
     return _wrap_replicates(
         sim,
-        random_seed=random_seed,
-        replicate_index=replicate_index,
         num_replicates=num_replicates,
+        replicate_index=replicate_index,
         provenance_dict=provenance_dict,
     )
 
@@ -1131,12 +1168,12 @@ class Simulator(_msprime.Simulator):
         tables,
         recombination_map,
         gene_conversion_map,
-        gene_conversion_track_length,
+        gene_conversion_tract_length,
         discrete_genome,
         ploidy,
-        random_generator,
         demography,
         model_change_events,
+        random_generator,
         model=None,
         store_migrations=False,
         store_full_arg=False,
@@ -1188,7 +1225,7 @@ class Simulator(_msprime.Simulator):
             avl_node_block_size=avl_node_block_size,
             node_mapping_block_size=node_mapping_block_size,
             gene_conversion_rate=gene_conversion_rate,
-            gene_conversion_track_length=gene_conversion_track_length,
+            gene_conversion_tract_length=gene_conversion_tract_length,
             discrete_genome=discrete_genome,
             ploidy=ploidy,
         )
@@ -1294,7 +1331,11 @@ class Simulator(_msprime.Simulator):
         )
 
     def run_replicates(
-        self, num_replicates, *, mutation_rate=None, provenance_dict=None
+        self,
+        num_replicates,
+        *,
+        mutation_rate=None,
+        provenance_dict=None,
     ):
         """
         Sequentially yield the specified number of simulation replicates.
@@ -1303,29 +1344,28 @@ class Simulator(_msprime.Simulator):
         # The JSON is modified for each replicate to insert the replicate number.
         # To avoid repeatedly encoding the same JSON (which can take milliseconds)
         # we insert a replaceable string.
-        placeholder = "@@_MSPRIME_REPLICATE_INDEX_@@"
+        placeholder = "@@_REPLICATE_INDEX_@@"
         if provenance_dict is not None:
             provenance_dict["parameters"]["replicate_index"] = placeholder
             encoded_provenance = provenance.json_encode_provenance(
                 provenance_dict, num_replicates
             )
-
-        for j in range(num_replicates):
+        for replicate_index in range(num_replicates):
             self.run()
-
             if mutation_rate is not None:
+                # This is only called from simulate() or the ms interface,
+                # so does not need any further parameters.
                 mutations._simple_mutate(
-                    self.tables,
-                    self.random_generator,
+                    tables=self.tables,
+                    random_generator=self.random_generator,
                     sequence_length=self.sequence_length,
                     rate=mutation_rate,
-                    discrete_sites=self.discrete_genome,
                 )
             tables = tskit.TableCollection.fromdict(self.tables.asdict())
             replicate_provenance = None
             if encoded_provenance is not None:
                 replicate_provenance = encoded_provenance.replace(
-                    f'"{placeholder}"', str(j)
+                    f'"{placeholder}"', str(replicate_index)
                 )
                 tables.provenances.add_row(replicate_provenance)
             yield tables.tree_sequence()
@@ -1510,8 +1550,8 @@ class BetaCoalescent(ParametricSimulationModel):
     if ploidy = 1, and
 
     .. math::
-        G = \\frac{m^{\\alpha} (N / 2)^{\\alpha - 1}}
-            {2 p \\alpha B(2 - \\alpha, \\alpha)},
+        G = \\frac{2 p m^{\\alpha} (N / 2)^{\\alpha - 1}}
+            {\\alpha B(2 - \\alpha, \\alpha)},
 
     if ploidy = :math:`p > 1`, where :math:`m` is the mean number of juveniles per
     family given by
@@ -1536,7 +1576,7 @@ class BetaCoalescent(ParametricSimulationModel):
         and can be dramatically shorter than in the case of the
         standard coalescent. For :math:`\\alpha \\approx 1` that is due to
         insensitivity of :math:`G` to :math:`N` --- see
-        :ref:`sec_api_simulation_models_multiple_mergers` for an illustration.
+        :ref:`sec_ancestry_models_multiple_mergers` for an illustration.
         For :math:`\\alpha \\approx 2`, :math:`G` is almost linear in
         :math:`N`, but can nevertheless be small because
         :math:`B(2 - \\alpha, \\alpha) \\rightarrow \\infty` as
@@ -1550,7 +1590,9 @@ class BetaCoalescent(ParametricSimulationModel):
     as well as the number of generations between common ancestor events.
     Note however that Schweinsberg (2003) only covers the haploid case.
     For details of the diploid extension, see
-    `Blath et al. (2013) <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3527250/>`_.
+    `Blath et al. (2013) <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3527250/>`_,
+    and `Birkner et al. (2018) <https://projecteuclid.org/euclid.ejp/1527818427>`_
+    for a diploid version of the Schweinsberg (2003) model specifically.
     The general polyploid model is analogous to the diploid case, with
     :math:`2 p` available copies of parental chromsomes per common ancestor event,
     and hence up to :math:`2 p` simultaneous mergers.
@@ -1604,8 +1646,8 @@ class DiracCoalescent(ParametricSimulationModel):
         rather than Wright-Fisher models. As a consequence, the number of generations
         between coalescence events is proportional to :math:`N^2`,
         rather than :math:`N` generations as in the standard coalescent.
-        See :ref:`sec_tutorial_multiple_mergers` for an illustration of how this
-        affects simulation output in practice.
+        See :ref:`sec_ancestry_models_multiple_mergers_examples` for an illustration
+        of how this affects simulation output in practice.
 
     :param float c: Determines the rate of potential multiple merger events.
         We require :math:`c > 0`.
