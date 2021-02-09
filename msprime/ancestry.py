@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2015-2020 University of Oxford
+# Copyright (C) 2015-2021 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -19,15 +19,20 @@
 """
 Module responsible for defining and running ancestry simulations.
 """
+from __future__ import annotations
+
 import collections.abc
 import copy
+import dataclasses
 import inspect
+import json
 import logging
 import math
 import struct
 import sys
+from typing import ClassVar
+from typing import Union
 
-import attr
 import numpy as np
 import tskit
 
@@ -38,7 +43,7 @@ from . import mutations
 from . import provenance
 from msprime import _msprime
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _model_factory(model):
@@ -46,7 +51,7 @@ def _model_factory(model):
     Returns a simulation model corresponding to the specified model.
     - If model is None, the default simulation model is returned.
     - If model is a string, return the corresponding model instance.
-    - If model is an instance of SimulationModel, return a copy of it.
+    - If model is an instance of AncestryModel, return a copy of it.
     - Otherwise raise a type error.
     """
     model_map = {
@@ -67,9 +72,9 @@ def _model_factory(model):
                 )
             )
         model_instance = model_map[lower_model]
-    elif not isinstance(model, SimulationModel):
+    elif not isinstance(model, AncestryModel):
         raise TypeError(
-            "Simulation model must be a string or an instance of SimulationModel"
+            "Simulation model must be a string or an instance of AncestryModel"
         )
     else:
         model_instance = model
@@ -79,13 +84,13 @@ def _model_factory(model):
 def _parse_model_change_events(events):
     """
     Parses the specified list of events provided in model_arg[1:] into
-    SimulationModelChange events. There are two different forms supported,
+    AncestryModelChange events. There are two different forms supported,
     and model descriptions are anything supported by model_factory.
     """
     err = (
         "Simulation model change events must be either a two-tuple "
         "(time, model), describing the time of the model change and "
-        "the new model or be an instance of SimulationModelChange."
+        "the new model or be an instance of AncestryModelChange."
     )
     model_change_events = []
     for event in events:
@@ -101,8 +106,8 @@ def _parse_model_change_events(events):
                         "Model change times must be either a floating point "
                         "value or None"
                     )
-            event = SimulationModelChange(t, _model_factory(event[1]))
-        elif isinstance(event, SimulationModelChange):
+            event = AncestryModelChange(t, _model_factory(event[1]))
+        elif isinstance(event, AncestryModelChange):
             # We don't want to modify our inputs, so take a deep copy.
             event = copy.copy(event)
             event.model = _model_factory(event.model)
@@ -122,7 +127,7 @@ def _parse_model_arg(model_arg):
         "interpreted as a simulation model or (b) a list in which "
         "the first element is a model description and the remaining "
         "elements are model change events. These can either be described "
-        "by a (time, model) tuple or SimulationModelChange instances."
+        "by a (time, model) tuple or AncestryModelChange instances."
     )
     if isinstance(model_arg, (list, tuple)):
         if len(model_arg) < 1:
@@ -138,14 +143,14 @@ def _parse_model_arg(model_arg):
 def _filter_events(demographic_events):
     """
     Returns a tuple (demographic_events, model_change_events) which separates
-    out the SimulationModelChange events from the list. This is to support the
+    out the AncestryModelChange events from the list. This is to support the
     pre-1.0 syntax for model changes, where they were included in the
     demographic_events parameter.
     """
     filtered_events = []
     model_change_events = []
     for event in demographic_events:
-        if isinstance(event, SimulationModelChange):
+        if isinstance(event, AncestryModelChange):
             model_change_events.append(event)
         else:
             filtered_events.append(event)
@@ -163,6 +168,10 @@ def _check_population_configurations(population_configurations):
             raise TypeError(err)
 
 
+# This class is only used in the 0.x interface.
+Sample = collections.namedtuple("Sample", ["population", "time"])
+
+
 def _samples_factory(sample_size, samples, population_configurations):
     """
     Returns a list of Sample objects, given the specified inputs.
@@ -176,7 +185,7 @@ def _samples_factory(sample_size, samples, population_configurations):
                 "Cannot specify sample size and population_configurations "
                 "simultaneously."
             )
-        s = demog.Sample(population=0, time=0.0)
+        s = Sample(population=0, time=0.0)
         the_samples = [s for _ in range(sample_size)]
     # If we have population configurations we may have embedded sample_size
     # values telling us how many samples to take from each population.
@@ -186,7 +195,7 @@ def _samples_factory(sample_size, samples, population_configurations):
             the_samples = []
             for j, conf in enumerate(population_configurations):
                 if conf.sample_size is not None:
-                    the_samples += [demog.Sample(j, 0) for _ in range(conf.sample_size)]
+                    the_samples += [Sample(j, 0) for _ in range(conf.sample_size)]
         else:
             for conf in population_configurations:
                 if conf.sample_size is not None:
@@ -201,46 +210,28 @@ def _samples_factory(sample_size, samples, population_configurations):
 
 
 def _demography_factory(
-    Ne, demography, population_configurations, migration_matrix, demographic_events
+    Ne, population_configurations, migration_matrix, demographic_events
 ):
-    if demography is not None:
-        if population_configurations is not None:
-            raise ValueError(
-                "The demography and population_configurations options "
-                "cannot be used together"
-            )
-        if migration_matrix is not None:
-            raise ValueError(
-                "The demography and migration_matrix options cannot be used together"
-            )
-        if demographic_events is not None:
-            raise ValueError(
-                "The demography and demographic_events options cannot be used together"
-            )
-        # Take a copy so that we don't modify the input parameters when
-        # resolving defaults
-        demography = copy.deepcopy(demography)
-    else:
-        demography = demog.Demography.from_old_style(
-            population_configurations, migration_matrix, demographic_events
-        )
-
-    # For any populations in which the initial size is None set it to Ne
-    for pop in demography.populations:
-        if pop.initial_size is None:
-            pop.initial_size = Ne
-
+    demography = demog.Demography.from_old_style(
+        population_configurations,
+        migration_matrix,
+        demographic_events,
+        Ne=Ne,
+    )
     demography.validate()
     return demography
 
 
 def _build_initial_tables(*, sequence_length, samples, ploidy, demography, pedigree):
+    # NOTE: this is only used in the simulate() codepath.
     tables = tskit.TableCollection(sequence_length)
 
     if pedigree is None:
         for index, (population, time) in enumerate(samples):
             tables.nodes.add_row(
-                flags=tskit.NODE_IS_SAMPLE, time=time, population=population
+                flags=tskit.NODE_IS_SAMPLE,
+                time=time,
+                population=population,
             )
             if population < 0:
                 raise ValueError(f"Negative population ID in sample at index {index}")
@@ -250,6 +241,8 @@ def _build_initial_tables(*, sequence_length, samples, ploidy, demography, pedig
                     f"at index {index}"
                 )
     else:
+        # TODO This should be removed - pedigree code path should only be callable
+        # from sim_ancestry
         for parents, time, is_sample in zip(
             pedigree.parents, pedigree.time, pedigree.is_sample
         ):
@@ -261,9 +254,14 @@ def _build_initial_tables(*, sequence_length, samples, ploidy, demography, pedig
             for _ in range(ploidy):
                 tables.nodes.add_row(node_flags, time, population=0, individual=ind_id)
 
+    # This is for the simulate() code path so we don't add metadata schemas
+    # and insert the user metadata in directly as encoded JSON, as before.
     for population in demography.populations:
-        md = population.temporary_hack_for_encoding_old_style_metadata()
-        tables.populations.add_row(metadata=md)
+        encoded_metadata = b""
+        if population.extra_metadata is not None:
+            encoded_metadata = json.dumps(population.extra_metadata).encode()
+        tables.populations.add_row(encoded_metadata)
+
     return tables
 
 
@@ -286,7 +284,6 @@ def _parse_simulate(
     end_time=None,
     record_full_arg=False,
     num_labels=None,
-    demography=None,
     random_seed=None,
 ):
     """
@@ -303,8 +300,6 @@ def _parse_simulate(
         and from_ts is None
     )
     if samples_specified:
-        # TODO remove the population_configurations message here if we're
-        # deprecating it?
         raise ValueError(
             "Either sample_size, samples, population_configurations or from_ts must "
             "be specified"
@@ -319,13 +314,13 @@ def _parse_simulate(
         if len(old_style_model_change_events) > 0:
             if len(model_change_events) > 0:
                 raise ValueError(
-                    "Cannot specify SimulationModelChange events using both new-style "
+                    "Cannot specify AncestryModelChange events using both new-style "
                     "and pre 1.0 syntax"
                 )
             model_change_events = old_style_model_change_events
 
     demography = _demography_factory(
-        Ne, demography, population_configurations, migration_matrix, demographic_events
+        Ne, population_configurations, migration_matrix, demographic_events
     )
 
     # The logic for checking from_ts and recombination map is bound together
@@ -345,6 +340,7 @@ def _parse_simulate(
                 "equal to the number of populations in from_ts"
             )
 
+    discrete_genome = False
     if recombination_map is None:
         # Default to 1 if no from_ts; otherwise default to the sequence length
         # of from_ts
@@ -360,6 +356,9 @@ def _parse_simulate(
         recombination_map = intervals.RateMap.uniform(the_length, the_rate)
     else:
         if isinstance(recombination_map, intervals.RecombinationMap):
+            if recombination_map._is_discrete:
+                logger.info("Emulating v0.x discrete sites simulation")
+                discrete_genome = True
             # Convert from the legacy RecombinationMap class
             recombination_map = recombination_map.map
         elif not isinstance(recombination_map, intervals.RateMap):
@@ -369,6 +368,7 @@ def _parse_simulate(
                 "Cannot specify length/recombination_rate along with "
                 "a recombination map"
             )
+
     if from_ts is not None:
         if recombination_map.sequence_length != from_ts.sequence_length:
             raise ValueError(
@@ -413,7 +413,7 @@ def _parse_simulate(
             recombination_map.sequence_length, 0
         ),
         gene_conversion_tract_length=0,
-        discrete_genome=False,
+        discrete_genome=discrete_genome,
         ploidy=2,
         random_generator=random_generator,
     )
@@ -495,7 +495,6 @@ def simulate(
     record_full_arg=False,
     num_labels=None,
     record_provenance=True,
-    demography=None,
 ):
     """
     Simulates the coalescent with recombination under the specified model
@@ -508,10 +507,8 @@ def simulate(
         specified or None, this defaults to the sum of the subpopulation sample
         sizes. Either ``sample_size``, ``population_configurations`` or
         ``samples`` must be specified.
-    :param float Ne: The effective (diploid) population size for the reference
-        population. This defaults to 1 if not specified.
-        Please see the :ref:`sec_api_simulation_models` section for more details
-        on specifying simulations models.
+    :param float Ne: The effective (diploid) population size. This defaults to
+        1 if not specified.
     :param float length: The length of the simulated region in bases.
         This parameter cannot be used along with ``recombination_map``.
         Defaults to 1 if not specified.
@@ -569,13 +566,13 @@ def simulate(
     :param int num_replicates: The number of replicates of the specified
         parameters to simulate. If this is not specified or None,
         no replication is performed and a :class:`tskit.TreeSequence` object
-        returned. If :obj:`num_replicates` is provided, the specified
+        returned. If `num_replicates` is provided, the specified
         number of replicates is performed, and an iterator over the
         resulting :class:`tskit.TreeSequence` objects returned.
     :param tskit.TreeSequence from_ts: If specified, initialise the simulation
         from the root segments of this tree sequence and return the
         completed tree sequence. Please see :ref:`here
-        <sec_api_simulate_from>` for details on the required properties
+        <sec_ancestry_initial_state>` for details on the required properties
         of this tree sequence and its interactions with other parameters.
         (Default: None).
     :param float start_time: If specified, set the initial time that the
@@ -596,9 +593,9 @@ def simulate(
         trees that have only one child). Defaults to False.
     :param model: The simulation model to use.
         This can either be a string (e.g., ``"smc_prime"``) or an instance of
-        a simulation model class (e.g, ``msprime.DiscreteTimeWrightFisher(100)``.
-        Please see the :ref:`sec_api_simulation_models` section for more details
-        on specifying simulations models.
+        a simulation model class (e.g, ``msprime.DiscreteTimeWrightFisher()``.
+        Please see the :ref:`sec_ancestry_models` section for more details
+        on specifying ancestry models.
     :type model: str or simulation model instance
     :param bool record_provenance: If True, record all configuration and parameters
         required to recreate the tree sequence. These can be accessed
@@ -606,7 +603,7 @@ def simulate(
     :return: The :class:`tskit.TreeSequence` object representing the results
         of the simulation if no replication is performed, or an
         iterator over the independent replicates simulated if the
-        :obj:`num_replicates` parameter has been used.
+        `num_replicates` parameter has been used.
     :rtype: :class:`tskit.TreeSequence` or an iterator over
         :class:`tskit.TreeSequence` replicates.
     """
@@ -670,7 +667,6 @@ def simulate(
         end_time=end_time,
         record_full_arg=record_full_arg,
         num_labels=num_labels,
-        demography=demography,
         random_seed=random_seed,
     )
     return _wrap_replicates(
@@ -732,100 +728,104 @@ def _parse_rate_map(rate_param, sequence_length, name):
     return rate_map
 
 
-def _insert_integer_samples(n, ploidy, tables):
-    """
-    Insert n individuals with the specified ploidy into the tables.
-    """
-    # Doing this with numpy is slighty obscure, but it's *much* faster
-    # than simple loops. For 10^7 samples with ploidy=2 we go from
-    # several minutes to a few seconds.
-    ind_flags = np.zeros(n, dtype=np.uint32)
-    tables.individuals.set_columns(flags=ind_flags)
-    node_individual = np.repeat(np.arange(n, dtype=np.int32), ploidy)
-    N = n * ploidy
-    tables.nodes.set_columns(
-        flags=np.full(N, tskit.NODE_IS_SAMPLE, dtype=np.uint32),
-        time=np.zeros(N),
-        population=np.zeros(N, dtype=np.int32),
-        individual=node_individual,
-    )
+def _get_population(demography, key):
+    if isinstance(key, str):
+        pop_id = demography.name_to_id(key)
+    elif core.isinteger(key):
+        pop_id = int(key)
+        if pop_id < 0 or pop_id >= demography.num_populations:
+            raise ValueError(f"Population ID '{key}' out of bounds")
+    else:
+        raise TypeError("Population references either be integer IDs or string names")
+    return pop_id
 
 
-def _parse_samples(samples, ploidy, tables):
+def _insert_sample_sets(sample_sets, demography, default_ploidy, tables):
     """
-    Parse the specified "samples" value and insert them into the specified
-    tables. How the samples argument is interpreted depends on the state
-    of the tables.
+    Insert the samples described in the specified {population_id: num_samples}
+    map into the specified set of tables.
     """
-    if isinstance(samples, collections.abc.Iterable):
-        # We check if the samples can be interpreted as a list first because
-        # we may want to extend the semantics here later to include specifying
-        # a set of individuals from a pedigree defined in the initial state.
-        # The most natural way to do this would be a numpy array of individual
-        # IDs. By checking the iterable condition first, we make sure that we're
-        # not interpreting input numpy arrays of length 1 as a numeric argument.
-        # Interpret as a list of Sample objects.
+    for sample_set in sample_sets:
+        n = sample_set.num_samples
+        population = demography.populations[sample_set.population]
+        time = population.sampling_time if sample_set.time is None else sample_set.time
+        ploidy = default_ploidy if sample_set.ploidy is None else sample_set.ploidy
+        logger.info(
+            f"Sampling {n} individuals with ploidy {ploidy} in population "
+            f"{sample_set.population} (name='{population.name}') at time {time}"
+        )
+        node_individual = len(tables.individuals) + np.repeat(
+            np.arange(n, dtype=np.int32), ploidy
+        )
+        ind_flags = np.zeros(n, dtype=np.uint32)
+        tables.individuals.append_columns(flags=ind_flags)
+        N = n * ploidy
+        tables.nodes.append_columns(
+            flags=np.full(N, tskit.NODE_IS_SAMPLE, dtype=np.uint32),
+            time=np.full(N, time),
+            population=np.full(N, sample_set.population, dtype=np.int32),
+            individual=node_individual,
+        )
 
-        # TODO this should probably be recast to using numpy input types for
-        # efficiency here. We could regard the input array as a numpy struct
-        # array, which would be a lot more efficient.
-        # See https://github.com/tskit-dev/msprime/issues/1211
-        for sample in samples:
-            if not isinstance(sample, demog.Sample):
-                raise TypeError("msprime.Sample object required")
-            if not core.isinteger(sample.population):
-                raise TypeError("Sample population references must be integers")
-            population = int(sample.population)
-            if population < 0:
-                raise ValueError("Negative population ID")
-            if sample.population >= len(tables.populations):
-                raise ValueError("Sample population ID out of bounds")
-            ind_id = tables.individuals.add_row(flags=0)
-            for _ in range(ploidy):
-                tables.nodes.add_row(
-                    flags=tskit.NODE_IS_SAMPLE,
-                    time=sample.time,
-                    population=population,
-                    individual=ind_id,
+
+def _parse_sample_sets(sample_sets, demography):
+    # Don't modify the inputs.
+    sample_sets = copy.deepcopy(sample_sets)
+    for sample_set in sample_sets:
+        if not isinstance(sample_set, SampleSet):
+            raise TypeError("msprime.SampleSet object required")
+        if not core.isinteger(sample_set.num_samples):
+            raise TypeError(
+                "The number of samples to draw from a population must be an integer"
+            )
+        sample_set.num_samples = int(sample_set.num_samples)
+        if sample_set.num_samples < 0:
+            raise ValueError("Number of samples cannot be negative")
+        if sample_set.population is None:
+            if demography.num_populations == 1:
+                sample_set.population = 0
+            else:
+                raise ValueError(
+                    "Must specify a SampleSet population in multipopulation models"
                 )
+        else:
+            sample_set.population = _get_population(demography, sample_set.population)
 
+    if sum(sample_set.num_samples for sample_set in sample_sets) == 0:
+        raise ValueError("Zero samples specified")
+    return sample_sets
+
+
+def _parse_samples(samples, demography, ploidy, tables):
+    """
+    Parse the specified "samples" value for sim_ancestry and insert them into the
+    specified tables.
+    """
+    if isinstance(samples, collections.abc.Sequence):
+        sample_sets = samples
+    elif isinstance(samples, collections.abc.Mapping):
+        sample_sets = [
+            SampleSet(num_samples, population)
+            for population, num_samples in samples.items()
+        ]
     elif core.isinteger(samples):
-        n = int(samples)
-        if n < 0:
-            raise ValueError("Cannot have a negative number of samples")
         if len(tables.populations) != 1:
             raise ValueError(
                 "Numeric samples can only be used in single population models. "
                 "Please use Demography.sample() to generate a list of samples "
                 "for your model, which can be used instead."
             )
-        _insert_integer_samples(n, ploidy, tables)
+        sample_sets = [SampleSet(samples)]
     else:
         raise TypeError(
-            "The samples argument must be either an integer (for single population "
-            "models) or a list of msprime.Sample objects. The Demography.sample() "
-            "function is useful for generating samples for complex demographic "
-            "models."
+            f"The value '{samples}' cannot be interpreted as sample specification. "
+            "Samples must either be a single integer, a dict that maps populations "
+            "to the number of samples for that population, or a list of SampleSet "
+            "objects. Please see the online documentation for more details on "
+            "the different forms."
         )
-
-
-def _parse_flag(value, *, default):
-    """
-    Parses a boolean flag, which can be either True, False, or None.
-    If the input value is None, return the default. Otherwise,
-    check that the input value is a bool.
-
-    Note that we do *not* cast to a bool as this would accept
-    truthy values like the empty list, etc. In this case None
-    would be converted to False, potentially conflicting with
-    the default value.
-    """
-    assert isinstance(default, bool)
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise TypeError("Boolean flag must be True, False, or None (the default value)")
-    return value
+    sample_sets = _parse_sample_sets(sample_sets, demography)
+    _insert_sample_sets(sample_sets, demography, ploidy, tables)
 
 
 def _parse_sim_ancestry(
@@ -857,10 +857,10 @@ def _parse_sim_ancestry(
 
     # Simple defaults.
     start_time = 0 if start_time is None else float(start_time)
-    end_time = sys.float_info.max if end_time is None else float(end_time)
-    discrete_genome = _parse_flag(discrete_genome, default=True)
-    record_full_arg = _parse_flag(record_full_arg, default=False)
-    record_migrations = _parse_flag(record_migrations, default=False)
+    end_time = math.inf if end_time is None else float(end_time)
+    discrete_genome = core._parse_flag(discrete_genome, default=True)
+    record_full_arg = core._parse_flag(record_full_arg, default=False)
+    record_migrations = core._parse_flag(record_migrations, default=False)
 
     if initial_state is not None:
         if isinstance(initial_state, tskit.TreeSequence):
@@ -946,8 +946,8 @@ def _parse_sim_ancestry(
                 )
         num_populations = 1 if initial_state is None else len(initial_state.populations)
         population_size = 1 if population_size is None else float(population_size)
-        demography = demog.Demography.island_model(
-            num_populations, migration_rate=0, Ne=population_size
+        demography = demog.Demography.isolated_model(
+            [population_size] * num_populations
         )
     elif isinstance(demography, demog.Demography):
         if population_size is not None:
@@ -963,7 +963,7 @@ def _parse_sim_ancestry(
             )
         initial_state = tskit.TableCollection(sequence_length)
         demography.insert_populations(initial_state)
-        _parse_samples(samples, ploidy, initial_state)
+        _parse_samples(samples, demography, ploidy, initial_state)
     else:
         if samples is not None:
             raise ValueError("Cannot specify both samples and initial_state")
@@ -1027,18 +1027,22 @@ def sim_ancestry(
 ):
     """
     Simulates an ancestral process described by a given model, demography and
-    set of samples and return the output as a
-    :class:`tskit.TreeSequence` (or a sequence of replicate tree sequences).
+    samples, and return a :class:`tskit.TreeSequence` (or a sequence of
+    replicate tree sequences).
 
     :param samples: The sampled individuals as either an integer, specifying
-        the number of individuals to sample at time zero in a single-population
-        model; or a list of :class:`.Sample` objects explicitly specifying the
-        time and population of every sample individual. Each sampled individual
-        corresponds to :math:`k` sample *nodes* when ``ploidy`` = :math:`k`.
+        the number of individuals to sample in a single-population model;
+        or a list of :class:`.SampleSet` objects defining the properties of
+        groups of similar samples; or as a mapping in which the keys
+        are population identifiers (either an integer ID or string name)
+        and the values are the number of samples to take from the corresponding
+        population at its default sampling time. It is important to note that
+        samples correspond to *individuals* here, and each sampled individual
+        is usually associated with :math:`k` sample *nodes* (or genomes) when
+        ``ploidy`` = :math:`k`. See :ref:`sec_ancestry_samples` for further details.
         Either ``samples`` or ``initial_state`` must be specified.
-        See :ref:`sec_ancestry_samples_ploidy` for usage examples.
     :param int ploidy: The number of monoploid genomes per sample individual
-        (Default=2). See :ref:`sec_ancestry_samples_ploidy` for usage examples.
+        (Default=2). See :ref:`sec_ancestry_ploidy` for usage examples.
     :param float sequence_length: The length of the genome sequence to simulate.
         See :ref:`sec_ancestry_genome_length` for usage examples
         for this parameter and how it interacts with other parameters.
@@ -1057,12 +1061,22 @@ def sim_ancestry(
         See :ref:`sec_ancestry_recombination` for usage examples
         for this parameter and how it interacts with other parameters.
     :param gene_conversion_rate: The rate of gene conversion along the sequence;
-        can be either a single value (specifying a single rate over the entire
-        sequence) or an instance of :class:`RateMap`. If provided, a value
-        for ``gene_conversion_tract_length`` must also be specified.
-        See :ref:`sec_ancestry_gene_conversion` for usage examples
+        can be a single value (specifying a single rate over the entire
+        sequence). Currently an instance of :class:`RateMap` is not supported.
+        If provided, a value for ``gene_conversion_tract_length`` must also be
+        specified. See :ref:`sec_ancestry_gene_conversion` for usage examples
         for this parameter and how it interacts with other parameters.
-    :param gene_conversion_tract_length: TODO
+    :param gene_conversion_tract_length: The mean length of the gene conversion
+        tracts. For discrete genomes the tract lengths are geometrically
+        distributed with mean ``gene_conversion_tract_length``, which must be
+        greater than or equal to 1. For continuous genomes the tract lengths are
+        exponentially distributed with mean ``gene_conversion_tract_length``,
+        which must be larger than 0.
+    :param population_size: The size of the default single population
+        :class:`.Demography`. If not specified, defaults to 1. Cannot be specified
+        along with the ``demography`` parameter. See the :ref:`sec_demography`
+        section for more details on demographic models and population sizes
+        and the :ref:`sec_ancestry_population_size` section for usage examples.
     :param int random_seed: The random seed. If this is not specified or `None`,
         a high-quality random seed will be automatically generated. Valid random
         seeds must be between 1 and :math:`2^{32} - 1`.
@@ -1070,7 +1084,7 @@ def sim_ancestry(
     :param int num_replicates: The number of replicates of the specified
         parameters to simulate. If this is not specified or `None`,
         no replication is performed and a :class:`tskit.TreeSequence` object
-        returned. If :obj:`num_replicates` is provided, the specified
+        returned. If `num_replicates` is provided, the specified
         number of replicates is performed, and an iterator over the
         resulting :class:`tskit.TreeSequence` objects returned.
         See :ref:`sec_ancestry_replication` for examples.
@@ -1102,16 +1116,16 @@ def sim_ancestry(
         also be present in the output tree sequence. If not specified or ``None``,
         run the simulation until all samples have an MRCA at all positions in
         the genome. See :ref:`sec_ancestry_end_time` for examples.
-    :param model: The simulation model to use.
+    :param model: The ancestry model to use.
         This can either be a string (e.g., ``"smc_prime"``) or an instance of
-        a simulation model class (e.g, ``msprime.DiscreteTimeWrightFisher()``.
-        Please see the :ref:`sec_api_simulation_models` section for more details
-        on specifying simulations models.
-    :type model: str or simulation model instance
+        an ancestry model class (e.g, ``msprime.DiscreteTimeWrightFisher()``.
+        Please see the :ref:`sec_ancestry_models` section for more details
+        on specifying ancestry models.
+    :type model: str or .AncestryModel
     :return: The :class:`tskit.TreeSequence` object representing the results
         of the simulation if no replication is performed, or an
         iterator over the independent replicates simulated if the
-        :obj:`num_replicates` parameter has been used.
+        `num_replicates` parameter has been used.
     :rtype: :class:`tskit.TreeSequence` or an iterator over
         :class:`tskit.TreeSequence` replicates.
     """
@@ -1205,7 +1219,7 @@ class Simulator(_msprime.Simulator):
 
         # FIXME support arbitrary gene conversion maps.
         # https://github.com/tskit-dev/msprime/issues/1212
-        assert len(gene_conversion_map) == 1
+        assert len(gene_conversion_map.rate) == 1
         gene_conversion_rate = gene_conversion_map.rate[0]
 
         start_time = -1 if start_time is None else start_time
@@ -1372,57 +1386,75 @@ class Simulator(_msprime.Simulator):
             self.reset()
 
 
+@dataclasses.dataclass
+class SampleSet:
+    """
+    TODO document
+    """
+
+    num_samples: int
+    population: Union[int, None] = None
+    time: Union[float, None] = None
+    ploidy: Union[int, None] = None
+
+    def asdict(self):
+        return dataclasses.asdict(self)
+
+
 # TODO update the documentation here to state that using this class is
 # deprecated, and users should use the model=[...] notation instead.
-@attr.s
-class SimulationModelChange:
+@dataclasses.dataclass
+class AncestryModelChange:
     """
-    An event representing a change of underlying :ref:`simulation model
-    <sec_api_simulation_models>`.
+    An event representing a change of underlying :ref:`ancestry model
+    <sec_ancestry_models>`.
 
-    :param float time: The time at which the simulation model changes
+    :param float time: The time at which the ancestry model changes
         to the new model, in generations. After this time, all internal
         tree nodes, edges and migrations are the result of the new model.
         If time is set to None (the default), the model change will occur
         immediately after the previous model has completed. If time is a
-        callable, the time at which the simulation model changes is the result
+        callable, the time at which the model changes is the result
         of calling this function with the time that the previous model
         started with as a parameter.
-    :param model: The new simulation model to use.
+    :param model: The new ancestry model to use.
         This can either be a string (e.g., ``"smc_prime"``) or an instance of
-        a simulation model class (e.g, ``msprime.DiscreteTimeWrightFisher(100)``.
-        Please see the :ref:`sec_api_simulation_models` section for more details
-        on specifying simulations models. If the argument is a string, the
-        reference population size is set from the top level ``Ne`` parameter
-        to :func:`.simulate`. If this is None (the default) the model is
-        changed to the standard coalescent with a reference_size of
-        Ne (if model was not specified).
-    :type model: str or simulation model instance
+        an ancestry model class (e.g, ``msprime.DiscreteTimeWrightFisher()``.
+        Please see the :ref:`sec_ancestry_models` section for more details
+        on specifying these models. If this is None (the default) the model is
+        changed to the standard coalescent.
+    :type model: str or .AncestryModel
     """
 
-    time = attr.ib(default=None)
-    model = attr.ib(default=None)
+    time: Union[float, None] = None
+    model: Union[str, AncestryModel, None] = None
 
     def asdict(self):
-        return attr.asdict(self)
+        return dataclasses.asdict(self)
 
 
-@attr.s
-class SimulationModel:
+class SimulationModelChange(AncestryModelChange):
     """
-    Abstract superclass of all simulation models.
+    Deprecated 0.x way to describe an :class:`AncestryModelChange`.
     """
 
-    name = None
+
+@dataclasses.dataclass
+class AncestryModel:
+    """
+    Abstract superclass of all ancestry models.
+    """
+
+    name: ClassVar[str]
 
     def get_ll_representation(self):
         return {"name": self.name}
 
     def asdict(self):
-        return attr.asdict(self)
+        return dataclasses.asdict(self)
 
 
-class StandardCoalescent(SimulationModel):
+class StandardCoalescent(AncestryModel):
     """
     The classical coalescent with recombination model (i.e., Hudson's algorithm).
     The string ``"hudson"`` can be used to refer to this model.
@@ -1433,7 +1465,7 @@ class StandardCoalescent(SimulationModel):
     name = "hudson"
 
 
-class SmcApproxCoalescent(SimulationModel):
+class SmcApproxCoalescent(AncestryModel):
     """
     The original SMC model defined by McVean and Cardin. This
     model is implemented using a naive rejection sampling approach
@@ -1446,7 +1478,7 @@ class SmcApproxCoalescent(SimulationModel):
     name = "smc"
 
 
-class SmcPrimeApproxCoalescent(SimulationModel):
+class SmcPrimeApproxCoalescent(AncestryModel):
     """
     The SMC' model defined by Marjoram and Wall as an improvement on the
     original SMC. model is implemented using a naive rejection sampling
@@ -1459,7 +1491,7 @@ class SmcPrimeApproxCoalescent(SimulationModel):
     name = "smc_prime"
 
 
-class DiscreteTimeWrightFisher(SimulationModel):
+class DiscreteTimeWrightFisher(AncestryModel):
     """
     A discrete backwards-time Wright-Fisher model, with diploid back-and-forth
     recombination. The string ``"dtwf"`` can be used to refer to this model.
@@ -1489,7 +1521,7 @@ class DiscreteTimeWrightFisher(SimulationModel):
     name = "dtwf"
 
 
-class WrightFisherPedigree(SimulationModel):
+class WrightFisherPedigree(AncestryModel):
     # TODO Complete documentation.
     # TODO Since the pedigree is a necessary parameter for this simulation
     # model and it cannot be used with any other model we should make it a
@@ -1503,9 +1535,9 @@ class WrightFisherPedigree(SimulationModel):
     name = "wf_ped"
 
 
-class ParametricSimulationModel(SimulationModel):
+class ParametricAncestryModel(AncestryModel):
     """
-    The superclass of simulation models that require extra parameters.
+    The superclass of ancestry models that require extra parameters.
     """
 
     def get_ll_representation(self):
@@ -1514,8 +1546,8 @@ class ParametricSimulationModel(SimulationModel):
         return d
 
 
-@attr.s
-class BetaCoalescent(ParametricSimulationModel):
+@dataclasses.dataclass
+class BetaCoalescent(ParametricAncestryModel):
     """
     A Lambda-coalescent with multiple mergers in the haploid cases, or a
     Xi-coalescent with simultaneous multiple mergers in the polyploid case.
@@ -1617,12 +1649,12 @@ class BetaCoalescent(ParametricSimulationModel):
 
     name = "beta"
 
-    alpha = attr.ib(default=None)
-    truncation_point = attr.ib(default=sys.float_info.max)
+    alpha: Union[float, None] = None
+    truncation_point: float = sys.float_info.max
 
 
-@attr.s
-class DiracCoalescent(ParametricSimulationModel):
+@dataclasses.dataclass
+class DiracCoalescent(ParametricAncestryModel):
     """
     A Lambda-coalescent with multiple mergers in the haploid cases, or a
     Xi-coalescent with simultaneous multiple mergers in the polyploid case.
@@ -1646,7 +1678,7 @@ class DiracCoalescent(ParametricSimulationModel):
         rather than Wright-Fisher models. As a consequence, the number of generations
         between coalescence events is proportional to :math:`N^2`,
         rather than :math:`N` generations as in the standard coalescent.
-        See :ref:`sec_ancestry_models_multiple_mergers_examples` for an illustration
+        See :ref:`sec_ancestry_models_multiple_mergers` for an illustration
         of how this affects simulation output in practice.
 
     :param float c: Determines the rate of potential multiple merger events.
@@ -1659,16 +1691,20 @@ class DiracCoalescent(ParametricSimulationModel):
 
     name = "dirac"
 
-    psi = attr.ib(default=None)
-    c = attr.ib(default=None)
+    psi: Union[float, None] = None
+    c: Union[float, None] = None
 
 
-@attr.s
-class SweepGenicSelection(ParametricSimulationModel):
-    # TODO document and finalise the API
+@dataclasses.dataclass
+class SweepGenicSelection(ParametricAncestryModel):
+    """
+    .. todo:: Document me
+    """
+
     name = "sweep_genic_selection"
-    position = attr.ib(default=None)
-    start_frequency = attr.ib(default=None)
-    end_frequency = attr.ib(default=None)
-    alpha = attr.ib(default=None)
-    dt = attr.ib(default=None)
+
+    position: Union[float, None] = None
+    start_frequency: Union[float, None] = None
+    end_frequency: Union[float, None] = None
+    alpha: Union[float, None] = None
+    dt: Union[float, None] = None

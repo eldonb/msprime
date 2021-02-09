@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2016-2020 University of Oxford
+# Copyright (C) 2016-2021 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -24,8 +24,10 @@ import itertools
 import json
 import math
 import random
+import textwrap
 import unittest
 import warnings
+import xml
 from unittest import mock
 
 import numpy as np
@@ -221,69 +223,37 @@ class TestIntrospectionInterface:
             "growth_rate=None, population=1)"
         )
         assert repr(event) == repr_s
-        str_s = "Population parameter change for 1: initial_size -> 2.0"
-        assert str(event) == str_s
-
-        event = msprime.PopulationParametersChange(1.0, population=1, growth_rate=2.0)
-        str_s = "Population parameter change for 1: growth_rate -> 2.0"
-        assert str(event) == str_s
-
-        event = msprime.PopulationParametersChange(
-            1.0, population=1, growth_rate=2.0, initial_size=4.0
-        )
-        str_s = (
-            "Population parameter change for 1: initial_size -> 4.0 growth_rate -> 2.0"
-        )
-        assert str(event) == str_s
+        assert str(event) == repr_s
 
     def test_migration_rate_change(self):
         event = msprime.MigrationRateChange(time=1, rate=2)
         repr_s = "MigrationRateChange(time=1, rate=2, source=-1, dest=-1)"
-        str_s = "Migration rate change to 2 everywhere"
         assert repr(event) == repr_s
-        assert str(event) == str_s
-
-        event = msprime.MigrationRateChange(time=1, rate=2, source=0, dest=1)
-        repr_s = "MigrationRateChange(time=1, rate=2, source=0, dest=1)"
-        str_s = "Migration rate change for (0, 1) to 2"
-        assert repr(event) == repr_s
-        assert str(event) == str_s
+        assert str(event) == repr_s
 
     def test_mass_migration(self):
         event = msprime.MassMigration(time=1, proportion=0.5, source=0, dest=1)
         repr_s = "MassMigration(time=1, source=0, dest=1, proportion=0.5)"
-        str_s = (
-            "Mass migration: Lineages moved with probability 0.5 backwards in time "
-            "with source 0 & dest 1 (equivalent to migration from 1 to 0 "
-            "forwards in time)"
-        )
         assert repr(event) == repr_s
-        # Too much hassle to track the exact whitespace in the output string.
-        assert str(event).split() == str_s.split()
+        assert str(event) == repr_s
 
     def test_simple_bottleneck(self):
         event = msprime.SimpleBottleneck(time=1, population=1, proportion=0.5)
         repr_s = "SimpleBottleneck(time=1, population=1, proportion=0.5)"
-        str_s = "Simple bottleneck: lineages in population 1 coalesce probability 0.5"
         assert repr(event) == repr_s
-        assert str(event) == str_s
+        assert str(event) == repr_s
 
     def test_instantaneous_bottleneck(self):
         event = msprime.InstantaneousBottleneck(time=1, population=1, strength=1.5)
         repr_s = "InstantaneousBottleneck(time=1, population=1, strength=1.5)"
-        str_s = (
-            "Instantaneous bottleneck in population 1: equivalent to 1.5 "
-            "generations of the coalescent"
-        )
         assert repr(event) == repr_s
-        assert str(event) == str_s
+        assert str(event) == repr_s
 
     def test_census(self):
         event = msprime.CensusEvent(time=1)
         repr_s = "CensusEvent(time=1)"
-        str_s = "Census event"
         assert repr(event) == repr_s
-        assert str(event) == str_s
+        assert str(event) == repr_s
 
 
 class TestDemographicEventsHaveExtraLLParameter:
@@ -308,7 +278,7 @@ class TestDemographicEventsHaveExtraLLParameter:
             msprime.MigrationRateChange(1.0, 1.0),
             msprime.MassMigration(1.0, 0),
             msprime.SimpleBottleneck(1.0, 0),
-            msprime.InstantaneousBottleneck(1.0),
+            msprime.InstantaneousBottleneck(1.0, 0),
             msprime.CensusEvent(1.0),
         ]
         for event in events:
@@ -604,76 +574,6 @@ class TestRateConversions:
         assert event.get_ll_representation() == ll_event
 
 
-class TestDemographyDebuggerOutput:
-    """
-    Tests for the demography debug interface.
-    """
-
-    def verify_debug(
-        self, population_configurations, migration_matrix, demographic_events
-    ):
-
-        dd = msprime.DemographyDebugger(
-            population_configurations=population_configurations,
-            migration_matrix=migration_matrix,
-            demographic_events=demographic_events,
-        )
-        # Check the reprs
-        s = repr(dd.epochs)
-        assert len(s) > 0
-        buff = io.StringIO()
-        dd.print_history(buff)
-        debug_output = buff.getvalue()
-        assert debug_output == str(dd)
-        # TODO when there is better output, write some tests to
-        # verify its format.
-        assert len(debug_output) > 0
-
-    def test_zero_samples(self):
-        population_configurations = [msprime.PopulationConfiguration(0)]
-        self.verify_debug(population_configurations, [[0]], [])
-        self.verify_debug(None, None, [])
-
-    def test_one_population(self):
-        population_configurations = [msprime.PopulationConfiguration(10)]
-        migration_matrix = [[0]]
-        demographic_events = [
-            msprime.PopulationParametersChange(0.1, initial_size=2),
-            msprime.PopulationParametersChange(0.1, growth_rate=10),
-        ]
-        self.verify_debug(
-            population_configurations, migration_matrix, demographic_events
-        )
-
-    def test_no_events(self):
-        population_configurations = [
-            msprime.PopulationConfiguration(10),
-            msprime.PopulationConfiguration(10),
-        ]
-        migration_matrix = [[0, 0], [0, 0]]
-        self.verify_debug(population_configurations, migration_matrix, [])
-
-    def test_demographic_events(self):
-        population_configurations = [
-            msprime.PopulationConfiguration(10),
-            msprime.PopulationConfiguration(10),
-        ]
-        migration_matrix = [[0, 0], [0, 0]]
-        demographic_events = [
-            msprime.PopulationParametersChange(0.1, initial_size=2),
-            msprime.PopulationParametersChange(0.1, growth_rate=10),
-            msprime.MigrationRateChange(0.2, matrix_index=(0, 1), rate=1),
-            msprime.MigrationRateChange(0.2, matrix_index=(1, 0), rate=1),
-            msprime.MassMigration(0.4, source=1, dest=0),
-            msprime.MigrationRateChange(0.4, rate=0),
-            msprime.InstantaneousBottleneck(0.5, population=0, strength=100),
-            msprime.CensusEvent(0.55),
-        ]
-        self.verify_debug(
-            population_configurations, migration_matrix, demographic_events
-        )
-
-
 class TestDemographyDebugger:
     """
     Tests for the demography debugger. Ensure that we compute the correct
@@ -964,6 +864,313 @@ class TestDemographyDebugger:
         with warnings.catch_warnings(record=True) as w:
             self.check_model_misspecification_warning(misspecify=False)
             assert len(w) == 0
+
+
+class TestDemographicEventMessages:
+    def test_population_parameters_change(self):
+        event = msprime.PopulationParametersChange(1.0, population=1, initial_size=2.0)
+        assert event._parameters() == "population=1, initial_size=2.0"
+        assert event._effect() == "initial_size → 2.0 for population 1"
+
+        event = msprime.PopulationParametersChange(
+            1.0, population="XX", growth_rate=2.0
+        )
+        assert event._parameters() == "population=XX, growth_rate=2.0"
+        assert event._effect() == "growth_rate → 2.0 for population XX"
+
+        event = msprime.PopulationParametersChange(
+            1.0, population=0, initial_size=3, growth_rate=2.0
+        )
+        assert event._parameters() == "population=0, initial_size=3, growth_rate=2.0"
+        assert (
+            event._effect() == "initial_size → 3 and growth_rate → 2.0 for population 0"
+        )
+
+        for pop in [None, -1]:
+            event = msprime.PopulationParametersChange(
+                1.0, population=pop, growth_rate=2.0
+            )
+            assert event._parameters() == "population=-1, growth_rate=2.0"
+            assert event._effect() == "growth_rate → 2.0 for all populations"
+
+    def test_migration_rate_change(self):
+        event = msprime.MigrationRateChange(time=1, rate=2)
+        assert event._parameters() == "source=-1, dest=-1, rate=2"
+        assert (
+            event._effect() == "Backwards-time migration rate for all populations → 2"
+        )
+
+        event = msprime.MigrationRateChange(source=0, dest=1, time=1, rate=6)
+        assert event._parameters() == "source=0, dest=1, rate=6"
+        assert event._effect() == ("Backwards-time migration rate from 0 to 1 → 6")
+
+    def test_mass_migration(self):
+        event = msprime.MassMigration(time=1, proportion=0.5, source=0, dest=1)
+        event._parameters() == "source=0, dest=1, proportion=0.5"
+        effect = (
+            "Lineages currently in population 0 move to 1 with probability 0.5 "
+            "(equivalent to individuals migrating from 1 to 0 forwards in time)"
+        )
+        assert event._effect() == effect
+
+    def test_simple_bottleneck(self):
+        event = msprime.SimpleBottleneck(time=1, population=1, proportion=0.5)
+        assert event._parameters() == "population=1, proportion=0.5"
+        assert event._effect() == (
+            "Lineages in population 1 coalesce with probability 0.5"
+        )
+
+    def test_instantaneous_bottleneck(self):
+        event = msprime.InstantaneousBottleneck(time=1, population=1, strength=1.5)
+        assert event._parameters() == "population=1, strength=1.5"
+        assert event._effect() == "Equivalent to 1.5 generations of the coalescent"
+
+    def test_census(self):
+        event = msprime.CensusEvent(time=1)
+        assert event._parameters() == ""
+        assert event._effect() == (
+            "Insert census nodes to record the location of all lineages"
+        )
+
+
+class DebugOutputBase:
+    def test_zero_samples_old_style(self):
+        population_configurations = [msprime.PopulationConfiguration(0)]
+        self.verify(msprime.Demography.from_old_style(population_configurations))
+
+    def test_one_population(self):
+        demography = msprime.Demography.isolated_model([10])
+        demography.events = [
+            msprime.PopulationParametersChange(0.1, initial_size=2),
+            msprime.PopulationParametersChange(0.1, growth_rate=10),
+        ]
+        self.verify(demography)
+
+    def test_no_events(self):
+        demography = msprime.Demography.isolated_model([10, 11])
+        self.verify(demography)
+
+    def test_island_model(self):
+        demography = msprime.Demography.island_model([100, 100], migration_rate=0.1)
+        self.verify(demography)
+
+    def test_primates_species_tree(self):
+        demography = msprime.Demography.from_species_tree(
+            "(((human:5.6,chimpanzee:5.6):3.0,gorilla:8.6):9.4,orangutan:18.0)",
+            initial_size=10_000,
+            time_units="myr",
+            generation_time=28,
+        )
+        self.verify(demography)
+
+    def test_all_events(self):
+        demography = msprime.Demography.isolated_model([1, 1])
+        demography.events = [
+            msprime.PopulationParametersChange(0.1, initial_size=2),
+            msprime.PopulationParametersChange(0.1, growth_rate=10),
+            msprime.MigrationRateChange(0.2, matrix_index=(0, 1), rate=1),
+            msprime.MigrationRateChange(0.2, matrix_index=(1, 0), rate=1),
+            msprime.MassMigration(0.4, source=1, dest=0),
+            msprime.MigrationRateChange(0.4, rate=0),
+            msprime.InstantaneousBottleneck(0.5, population=0, strength=100),
+            msprime.CensusEvent(0.55),
+            msprime.SimpleBottleneck(0.56, population=1, proportion=0.1),
+        ]
+        self.verify(demography)
+
+
+class TestDemographyHtml(DebugOutputBase):
+    def verify(self, demography):
+        html = demography._repr_html_()
+        root = xml.etree.ElementTree.fromstring(html)
+        assert root.tag == "p"
+        children = list(root)
+        assert len(children) == 3
+        for child in children:
+            assert child.tag == "table"
+        pop_table = children[0]
+        rows = list(pop_table.find("tbody"))
+        assert len(rows) == demography.num_populations
+        migration_matrix_table = children[1]
+        rows = list(migration_matrix_table.find("tbody"))
+        assert len(rows) == demography.num_populations
+        for row in rows:
+            assert len(row) == demography.num_populations + 1
+        events_table = children[2]
+        rows = list(events_table.find("tbody"))
+        assert len(rows) == len(demography.events)
+        # TODO add more tests when the output format is finalised.
+
+
+class TestDemographyDebuggerHtml(DebugOutputBase):
+    def verify(self, demography):
+        debugger = demography.debug()
+        html = debugger._repr_html_()
+        root = xml.etree.ElementTree.fromstring(html)
+        assert root.tag == "div"
+        children = list(root)
+        assert len(children) == len(debugger.epochs)
+        # TODO add more tests when the output format is finalised.
+
+
+class TestDemographyText(DebugOutputBase):
+    def verify(self, demography):
+        text = str(demography)
+        assert text.startswith("Demography")
+        sections = text.split("╟")
+        assert len(sections) == 4
+        assert sections[0].startswith("Demography")
+        sec_demography = sections[1].splitlines()
+        assert len(sec_demography) == demography.num_populations + 5
+        sec_migration_matrix = sections[2].splitlines()
+        assert len(sec_migration_matrix) == demography.num_populations + 5
+        # We don't really know how many lines will be in the events section.
+
+
+class TestDemographyDebuggerText(DebugOutputBase):
+    def verify(self, demography):
+        debugger = demography.debug()
+        text = str(debugger)
+        assert text.startswith("DemographyDebugger")
+        sections = text.split("Epoch")
+        assert len(sections) - 1 == len(debugger.epochs)
+        # Check the deprecated interface.
+        buff = io.StringIO()
+        debugger.print_history(buff)
+        assert text == buff.getvalue()
+
+
+class TestDemographyTextExamples:
+    def test_one_population(self):
+        demography = msprime.Demography.isolated_model([10])
+        out = textwrap.dedent(
+            """\
+        Demography
+        ╟  Populations
+        ║  ┌────────────────────────────────────────────────────────────────────────┐
+        ║  │ id │name   │description  │initial_size  │ growth_rate │extra_metadata  │
+        ║  ├────────────────────────────────────────────────────────────────────────┤
+        ║  │ 0  │pop_0  │None         │10.0          │     0.0     │{}              │
+        ║  └────────────────────────────────────────────────────────────────────────┘
+        ╟  Migration Matrix
+        ║  ┌───────────────┐
+        ║  │       │ pop_0 │
+        ║  ├───────────────┤
+        ║  │  pop_0│   0   │
+        ║  └───────────────┘
+        ╟  Events
+        ║  ┌───────────────────────────────────┐
+        ║  │  time│type  │parameters  │effect  │
+        ║  ├───────────────────────────────────┤
+        ║  └───────────────────────────────────┘
+        """
+        )
+        assert out == str(demography)
+
+    def test_two_populations(self):
+        demography = msprime.Demography.isolated_model([10, 20], growth_rate=[1, 2])
+        demography.migration_matrix[0, 1] = 0.1
+        demography.migration_matrix[1, 0] = 0.2
+        out = textwrap.dedent(
+            """\
+        Demography
+        ╟  Populations
+        ║  ┌────────────────────────────────────────────────────────────────────────┐
+        ║  │ id │name   │description  │initial_size  │ growth_rate │extra_metadata  │
+        ║  ├────────────────────────────────────────────────────────────────────────┤
+        ║  │ 0  │pop_0  │None         │10.0          │     1.0     │{}              │
+        ║  │ 1  │pop_1  │None         │20.0          │     2.0     │{}              │
+        ║  └────────────────────────────────────────────────────────────────────────┘
+        ╟  Migration Matrix
+        ║  ┌───────────────────────┐
+        ║  │       │ pop_0 │ pop_1 │
+        ║  ├───────────────────────┤
+        ║  │  pop_0│   0   │  0.1  │
+        ║  │  pop_1│  0.2  │   0   │
+        ║  └───────────────────────┘
+        ╟  Events
+        ║  ┌───────────────────────────────────┐
+        ║  │  time│type  │parameters  │effect  │
+        ║  ├───────────────────────────────────┤
+        ║  └───────────────────────────────────┘
+        """
+        )
+        assert out == str(demography)
+
+    def test_all_events(self):
+        demography = msprime.Demography.isolated_model([1, 1])
+        demography.events = [
+            msprime.PopulationParametersChange(0.1, initial_size=2),
+            msprime.PopulationParametersChange(0.1, growth_rate=10),
+            msprime.PopulationParametersChange(0.1, growth_rate=10, initial_size=1),
+            msprime.MigrationRateChange(0.2, matrix_index=(0, 1), rate=1),
+            msprime.MigrationRateChange(0.2, matrix_index=(1, 0), rate=1),
+            msprime.MassMigration(0.4, source=1, dest=0),
+            msprime.MigrationRateChange(0.4, rate=0),
+            msprime.InstantaneousBottleneck(0.5, population=0, strength=100),
+            msprime.CensusEvent(0.55),
+            msprime.SimpleBottleneck(0.56, population=1, proportion=0.1),
+        ]
+
+        out = textwrap.dedent(
+            """\
+        Demography
+        ╟  Populations
+        ║  ┌────────────────────────────────────────────────────────────────────────┐
+        ║  │ id │name   │description  │initial_size  │ growth_rate │extra_metadata  │
+        ║  ├────────────────────────────────────────────────────────────────────────┤
+        ║  │ 0  │pop_0  │None         │1.0           │     0.0     │{}              │
+        ║  │ 1  │pop_1  │None         │1.0           │     0.0     │{}              │
+        ║  └────────────────────────────────────────────────────────────────────────┘
+        ╟  Migration Matrix
+        ║  ┌───────────────────────┐
+        ║  │       │ pop_0 │ pop_1 │
+        ║  ├───────────────────────┤
+        ║  │  pop_0│   0   │   0   │
+        ║  │  pop_1│   0   │   0   │
+        ║  └───────────────────────┘
+        ╟  Events
+        ║  ┌──────────────────────────────────────────────────────────────────────────────────────┐
+        ║  │  time│type            │parameters           │effect                                  │
+        ║  ├──────────────────────────────────────────────────────────────────────────────────────┤
+        ║  │   0.1│Population      │population=-1,       │initial_size → 2 for all populations    │
+        ║  │      │parameter       │initial_size=2       │                                        │
+        ║  │      │change          │                     │                                        │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.1│Population      │population=-1,       │growth_rate → 10 for all populations    │
+        ║  │      │parameter       │growth_rate=10       │                                        │
+        ║  │      │change          │                     │                                        │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.1│Population      │population=-1,       │initial_size → 1 and growth_rate → 10   │
+        ║  │      │parameter       │initial_size=1,      │for all populations                     │
+        ║  │      │change          │growth_rate=10       │                                        │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.2│Migration rate  │source=0, dest=1,    │Backwards-time migration rate from 0    │
+        ║  │      │change          │rate=1               │to 1 → 1                                │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.2│Migration rate  │source=1, dest=0,    │Backwards-time migration rate from 1    │
+        ║  │      │change          │rate=1               │to 0 → 1                                │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.4│Mass Migration  │source=1, dest=0,    │Lineages currently in population 1      │
+        ║  │      │                │proportion=1.0       │move to 0 with probability 1.0          │
+        ║  │      │                │                     │(equivalent to individuals migrating    │
+        ║  │      │                │                     │from 0 to 1 forwards in time)           │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.4│Migration rate  │source=-1, dest=-1,  │Backwards-time migration rate for all   │
+        ║  │      │change          │rate=0               │populations → 0                         │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │   0.5│Instantaneous   │population=0,        │Equivalent to 100 generations of the    │
+        ║  │      │Bottleneck      │strength=100         │coalescent                              │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │  0.55│Census          │                     │Insert census nodes to record the       │
+        ║  │      │                │                     │location of all lineages                │
+        ║  │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈│
+        ║  │  0.56│Simple          │population=1,        │Lineages in population 1 coalesce with  │
+        ║  │      │Bottleneck      │proportion=0.1       │probability 0.1                         │
+        ║  └──────────────────────────────────────────────────────────────────────────────────────┘
+        """  # noqa: B950
+        )
+        assert out == str(demography)
 
 
 class TestDemographyTrajectories(unittest.TestCase):
@@ -1449,6 +1656,7 @@ class TestDemographyTrajectories(unittest.TestCase):
         )
         return ddb
 
+    @pytest.mark.slow
     def test_random_example(self):
         ddb = self.get_random_example()
         num_samples = list(range(ddb.num_populations))
@@ -2580,10 +2788,13 @@ class HistoricalSamplingMixin:
         N = 100
         sampling_time = 1.01 * N
         ts = msprime.sim_ancestry(
-            population_size=N,
+            demography=msprime.Demography.island_model([N, N], migration_rate=1),
+            samples=[
+                msprime.SampleSet(1, population=0),
+                msprime.SampleSet(1, population=1, time=sampling_time),
+            ],
             ploidy=2,
             model=self.model,
-            samples=[msprime.Sample(0, 0), msprime.Sample(0, sampling_time)],
             random_seed=3,
         )
         for t in ts.trees():
@@ -3024,9 +3235,9 @@ class TestEventsBetweenGenerationsWrightFisher:
             assert node.time == int(node.time)
 
 
-class TestPopulationMetadata:
+class TestOldStylePopulationMetadata:
     """
-    Tests for the metadata behaviour on populations.
+    Tests for the metadata behaviour on PopulationConfiguration objects.
     """
 
     def test_simple_case(self):
@@ -3037,17 +3248,68 @@ class TestPopulationMetadata:
         )
         assert ts.num_populations == 1
         pop = ts.population(0)
-        assert md == json.loads(pop.metadata.decode())
+        assert md == json.loads(pop.metadata)
+
+    def test_old_style_metadata_via_sim_ancestry(self):
+        md = {"x": "y"}
+        demography = msprime.Demography.from_old_style(
+            population_configurations=[
+                msprime.PopulationConfiguration(initial_size=1, metadata=md)
+            ]
+        )
+        ts = msprime.sim_ancestry(2, demography=demography, random_seed=1)
+        assert ts.num_populations == 1
+        pop = ts.population(0)
+        expected = {
+            "name": "pop_0",
+            "description": None,
+            **md,
+        }
+        assert expected == pop.metadata
+
+    def test_old_style_metadata_description_is_merged(self):
+        md = {"description": "y"}
+        demography = msprime.Demography.from_old_style(
+            population_configurations=[
+                msprime.PopulationConfiguration(initial_size=1, metadata=md)
+            ]
+        )
+        ts = msprime.sim_ancestry(2, demography=demography, random_seed=1)
+        assert ts.num_populations == 1
+        pop = ts.population(0)
+        expected = {
+            "name": "pop_0",
+            "description": "y",
+        }
+        assert expected == pop.metadata
+
+    def test_old_style_metadata_name_is_merged(self):
+        md = {"name": "y"}
+        demography = msprime.Demography.from_old_style(
+            population_configurations=[
+                msprime.PopulationConfiguration(initial_size=1, metadata=md)
+            ]
+        )
+        ts = msprime.sim_ancestry(2, demography=demography, random_seed=1)
+        assert ts.num_populations == 1
+        pop = ts.population(0)
+        expected = {
+            "name": "y",
+            "description": None,
+        }
+        assert expected == pop.metadata
 
     def test_default(self):
         ts = msprime.simulate(
             population_configurations=[msprime.PopulationConfiguration(2)],
             random_seed=1,
         )
+
         assert ts.num_populations == 1
         pop = ts.population(0)
-        assert b"" == pop.metadata
+        assert pop.metadata == b""
 
+        # An explicit value of None also gives us an empty user metadata dict.
         ts = msprime.simulate(
             population_configurations=[
                 msprime.PopulationConfiguration(2, metadata=None)
@@ -3056,14 +3318,13 @@ class TestPopulationMetadata:
         )
         assert ts.num_populations == 1
         pop = ts.population(0)
-        assert b"" == pop.metadata
+        assert pop.metadata == b""
 
     def test_errors(self):
         for bad_metadata in [b"asdf", Exception]:
-            popconf = msprime.PopulationConfiguration(2, metadata=bad_metadata)
-            pop = msprime.Population.from_old_style(popconf)
+            pop_conf = msprime.PopulationConfiguration(2, metadata=bad_metadata)
             with pytest.raises(TypeError):
-                pop.temporary_hack_for_encoding_old_style_metadata()
+                msprime.simulate(population_configurations=[pop_conf])
 
     def test_multi_population(self):
         for num_pops in range(1, 10):
@@ -3077,7 +3338,66 @@ class TestPopulationMetadata:
             assert ts.num_populations == num_pops
             for j in range(num_pops):
                 pop = ts.population(j)
-                assert pop_configs[j].metadata == json.loads(pop.metadata.decode())
+                assert pop_configs[j].metadata == json.loads(pop.metadata)
+
+
+class TestPopulationMetadata:
+    """
+    Tests for the metadata behaviour on Population objects.
+    """
+
+    def test_defaults(self):
+        demography = msprime.Demography.isolated_model([10])
+        ts = msprime.sim_ancestry(2, demography=demography, random_seed=2)
+        assert ts.num_populations == 1
+        metadata = ts.population(0).metadata
+        assert metadata["name"] == "pop_0"
+        assert metadata["description"] is None
+        assert len(metadata) == 2
+
+    def test_extra_metadata(self):
+        demography = msprime.Demography.isolated_model([10])
+        md = {"x": "y", "z": "z", "abc": 1234}
+        demography.populations[0].extra_metadata = md
+        ts = msprime.sim_ancestry(2, demography=demography, random_seed=2)
+        assert ts.num_populations == 1
+        metadata = ts.population(0).metadata
+        assert metadata["name"] == "pop_0"
+        assert metadata["description"] is None
+        assert len(metadata) == len(md) + 2
+        for key, value in md.items():
+            assert metadata[key] == value
+
+    def test_extra_metadata_overwrite_standard(self):
+        demography = msprime.Demography.isolated_model([10])
+        md = {"x": 1234, "name": "abc"}
+        demography.populations[0].extra_metadata = md
+        with pytest.raises(ValueError) as record:
+            msprime.sim_ancestry(2, demography=demography, random_seed=2)
+        assert str(record.value).startswith(
+            "Cannot set standard metadata key(s) ['name']"
+        )
+
+        md = {"x": 1234, "name": "abc", "description": "sdf"}
+        demography.populations[0].extra_metadata = md
+        with pytest.raises(ValueError) as record:
+            msprime.sim_ancestry(2, demography=demography, random_seed=2)
+        assert str(record.value).startswith(
+            "Cannot set standard metadata key(s) ['description', 'name']"
+        )
+
+    def test_island_model(self):
+        demography = msprime.Demography.island_model([1] * 10, migration_rate=0)
+        for j, pop in enumerate(demography.populations):
+            pop.extra_metadata = {"x": "y", "z": "z" * j, "abc": 1234}
+            pop.description = f"Island model node {j}"
+        ts = msprime.sim_ancestry({0: 2}, demography=demography, random_seed=2)
+        assert ts.num_populations == demography.num_populations
+        for j in range(demography.num_populations):
+            metadata = ts.population(j).metadata
+            assert metadata["name"] == f"pop_{j}"
+            assert metadata["description"] == demography.populations[j].description
+            assert len(metadata) == 2 + len(pop.extra_metadata)
 
 
 class TestCensusEvent:
@@ -3355,12 +3675,13 @@ class TestLineageProbabilities:
         return dd, f
 
     def verify_simulation(self, dd):
-        samples = [
-            msprime.Sample(pop, time)
-            for pop in range(dd.num_populations)
-            for time in dd.epoch_times
-        ]
-        reps = msprime.simulate(
+        samples = []
+        for pop_id in range(dd.num_populations):
+            for time in dd.epoch_times:
+                samples.append(
+                    msprime.SampleSet(1, population=pop_id, ploidy=1, time=time)
+                )
+        reps = msprime.sim_ancestry(
             samples=samples,
             demography=dd.demography,
             end_time=max(dd.epoch_times + 1),
@@ -3401,6 +3722,7 @@ class TestLineageProbabilities:
                     assert np.allclose(P[j, :, :], f(t))
             self.verify_simulation(dd)
 
+    @pytest.mark.slow
     def test_lineage_probabilities_tree(self):
         dem_events = [
             msprime.MassMigration(time=50, source=3, destination=2),
@@ -3516,77 +3838,89 @@ class TestPreCannedModels:
 
 class TestIslandModel(TestPreCannedModels):
     def test_errors(self):
-        for bad_N in [-1, 0, 0.1]:
+        for bad_N in [-1, -1e6]:
             with pytest.raises(ValueError):
-                msprime.Demography.island_model(bad_N, 0.1)
+                msprime.Demography.island_model([bad_N], 0.1)
         for bad_m in [-1, -1e5]:
             with pytest.raises(ValueError):
-                msprime.Demography.island_model(1, bad_m)
-
-        for bad_Ne in [-1, 0]:
-            with pytest.raises(ValueError):
-                msprime.Demography.island_model(1, 1, Ne=bad_Ne)
+                msprime.Demography.island_model([1], bad_m)
 
     def test_one_pop(self):
-        model = msprime.Demography.island_model(1, 1)
+        model = msprime.Demography.island_model([1], migration_rate=1)
         assert len(model.populations) == 1
         assert len(model.migration_matrix) == 1
-        ts = msprime.simulate(samples=model.sample(2), demography=model, random_seed=1)
+        ts = msprime.sim_ancestry(samples={0: 2}, demography=model, random_seed=1)
         assert ts.num_populations == 1
 
     def test_migration(self):
         for N in [1, 2, 5]:
-            model = msprime.Demography.island_model(N, 0.1)
+            model = msprime.Demography.island_model([1] * N, 0.1)
             assert len(model.populations) == N
             assert model.migration_matrix.shape == (N, N)
             self.assertZeroDiagonal(model.migration_matrix)
             assert np.all(model.migration_matrix[~np.eye(N, dtype=bool)] == 0.1)
-            ts = msprime.simulate(
-                samples=model.sample(*([2] * N)), demography=model, random_seed=1
+            ts = msprime.sim_ancestry(
+                samples={j: 1 for j in range(N)}, demography=model, random_seed=1
             )
             assert ts.num_populations == N
             assert ts.num_samples == 2 * N
 
-    def test_Ne(self):
-        # By default, Ne is 1
-        model = msprime.Demography.island_model(2, 0.1)
-        assert model.populations[0].initial_size == 1
-        assert model.populations[1].initial_size == 1
+    def test_initial_size(self):
         for Ne in [0.1, 1, 10]:
-            model = msprime.Demography.island_model(2, 0.1, Ne=Ne)
+            model = msprime.Demography.island_model([Ne, Ne], 0.1)
             assert model.populations[0].initial_size == Ne
             assert model.populations[1].initial_size == Ne
+
+    def test_migration_zero(self):
+        initial_size = [1, 2, 3, 4]
+        growth_rate = [0.1, 0.2, 0.3, 0.4]
+        model1 = msprime.Demography.island_model(
+            initial_size, growth_rate=growth_rate, migration_rate=0
+        )
+        model2 = msprime.Demography.isolated_model(
+            initial_size, growth_rate=growth_rate
+        )
+        assert model1 == model2
 
 
 class TestSteppingStoneModel(TestPreCannedModels):
     def test_errors(self):
-        for bad_N in [-1, 0, 0.1]:
+        for bad_N in [-1, -1000, np.nan]:
             with pytest.raises(ValueError):
-                msprime.Demography.stepping_stone_1d(bad_N, 0.1)
+                msprime.Demography.stepping_stone_model([bad_N], 0.1)
         for bad_m in [-1, -1e5]:
             with pytest.raises(ValueError):
-                msprime.Demography.stepping_stone_1d(1, bad_m)
+                msprime.Demography.stepping_stone_model([1], bad_m)
 
-        for bad_Ne in [-1, 0]:
-            with pytest.raises(ValueError):
-                msprime.Demography.stepping_stone_1d(1, 1, Ne=bad_Ne)
+    def test_migration_zero(self):
+        initial_size = [1, 2, 3, 4]
+        growth_rate = [0.1, 0.2, 0.3, 0.4]
+        model1 = msprime.Demography.stepping_stone_model(
+            initial_size, growth_rate=growth_rate, migration_rate=0
+        )
+        model2 = msprime.Demography.isolated_model(
+            initial_size, growth_rate=growth_rate
+        )
+        assert model1 == model2
 
     def test_one_pop(self):
-        for circular in [True, False]:
-            model = msprime.Demography.stepping_stone_1d(1, 1, circular=circular)
+        for boundaries in [True, False]:
+            model = msprime.Demography.stepping_stone_model(
+                [1], 1, boundaries=boundaries
+            )
             assert len(model.populations) == 1
             assert len(model.migration_matrix) == 1
-            ts = msprime.simulate(
-                samples=model.sample(2), demography=model, random_seed=1
-            )
+            ts = msprime.sim_ancestry(samples={0: 2}, demography=model, random_seed=1)
             assert ts.num_populations == 1
 
     def test_migration_circular(self):
         m = 0.3
         for N in [2, 3, 5]:
-            model = msprime.Demography.stepping_stone_1d(N, m)
+            model = msprime.Demography.stepping_stone_model([1] * N, m)
             # Circular is the default
-            assert model == msprime.Demography.stepping_stone_1d(N, m, circular=True)
+            assert model == msprime.Demography.stepping_stone_model(
+                [1] * N, m, boundaries=False
+            )
             assert len(model.populations) == N
             assert model.migration_matrix.shape == (N, N)
             self.assertZeroDiagonal(model.migration_matrix)
@@ -3597,15 +3931,15 @@ class TestSteppingStoneModel(TestPreCannedModels):
                         assert model.migration_matrix[j, k] == m
                     else:
                         assert model.migration_matrix[j, k] == 0
-            ts = msprime.simulate(
-                samples=model.sample(*([2] * N)), demography=model, random_seed=1
+            ts = msprime.sim_ancestry(
+                samples={j: 2 for j in range(N)}, demography=model, random_seed=1
             )
             assert ts.num_populations == N
-            assert ts.num_samples == 2 * N
+            assert ts.num_samples == 4 * N
 
     def test_migration_line_two_pops(self):
         m = 1
-        model = msprime.Demography.stepping_stone_1d(2, m, circular=False)
+        model = msprime.Demography.stepping_stone_model([1, 1], m, boundaries=True)
         assert len(model.populations) == 2
         assert model.migration_matrix.shape == (2, 2)
         assert np.all(model.migration_matrix == 0)
@@ -3613,7 +3947,7 @@ class TestSteppingStoneModel(TestPreCannedModels):
     def test_migration_line(self):
         m = 0.3
         for N in [3, 4, 5]:
-            model = msprime.Demography.stepping_stone_1d(N, m, circular=False)
+            model = msprime.Demography.stepping_stone_model([1] * N, m, boundaries=True)
             assert len(model.populations) == N
             assert model.migration_matrix.shape == (N, N)
             self.assertZeroDiagonal(model.migration_matrix)
@@ -3628,21 +3962,29 @@ class TestSteppingStoneModel(TestPreCannedModels):
                         assert model.migration_matrix[j, k] == m
                     else:
                         assert model.migration_matrix[j, k] == 0
-            ts = msprime.simulate(
-                samples=model.sample(*([2] * N)), demography=model, random_seed=1
+            ts = msprime.sim_ancestry(
+                samples={j: 2 for j in range(N)}, demography=model, random_seed=1
             )
             assert ts.num_populations == N
-            assert ts.num_samples == 2 * N
+            assert ts.num_samples == 4 * N
 
     def test_Ne(self):
-        # By default, Ne is 1
-        model = msprime.Demography.stepping_stone_1d(2, 0.1)
+        model = msprime.Demography.stepping_stone_model([1, 1], 0.1)
         assert model.populations[0].initial_size == 1
         assert model.populations[1].initial_size == 1
         for Ne in [0.1, 1, 10]:
-            model = msprime.Demography.stepping_stone_1d(2, 0.1, Ne=Ne)
+            model = msprime.Demography.stepping_stone_model([Ne, Ne], 0.1)
             assert model.populations[0].initial_size == Ne
             assert model.populations[1].initial_size == Ne
+
+
+class TestDemographicEventBase:
+    def test_str_methods_not_implemented(self):
+        de = msprime.DemographicEvent(0)
+        with pytest.raises(NotImplementedError):
+            de._parameters()
+        with pytest.raises(NotImplementedError):
+            de._effect()
 
 
 class TestDemographyObject:
@@ -3651,15 +3993,15 @@ class TestDemographyObject:
     """
 
     def test_equality(self):
-        m1 = msprime.Demography.island_model(2, 1 / 3)
-        m2 = msprime.Demography.island_model(2, 1 / 3)
+        m1 = msprime.Demography.island_model([1, 1], 1 / 3)
+        m2 = msprime.Demography.island_model([1, 1], 1 / 3)
         assert m1 == m2
         assert m2 == m1
         assert m1 == m1
         assert not (m1 != m2)
         assert not (m1 != m1)
 
-        m3 = msprime.Demography.island_model(2, 1 / 3 + 0.001)
+        m3 = msprime.Demography.island_model([1, 1], 1 / 3 + 0.001)
         assert m1 != m3
         assert m1 != m3
 
@@ -3667,138 +4009,120 @@ class TestDemographyObject:
         assert m1 != []
 
     def test_debug(self):
-        model = msprime.Demography.island_model(2, 1 / 3)
+        model = msprime.Demography.island_model([1, 1], 1 / 3)
         dbg1 = model.debug()
         assert dbg1.demography == model
         dbg2 = msprime.DemographyDebugger(demography=model)
         assert dbg1.demography == dbg2.demography
         assert str(dbg1) == str(dbg2)
 
-    def test_positional_sampling_errors(self):
-        model = msprime.Demography.island_model(2, 1)
-        with pytest.raises(ValueError):
-            # Sampling from no populations is an error (this is almost
-            # certainly a mistake by the user).
-            model.sample()
-        for bad_sample in [(1, -1), (-1,), (0, -10)]:
-            with pytest.raises(ValueError):
-                model.sample(*bad_sample)
-        with pytest.raises(TypeError):
-            model.sample(6.6)
-        with pytest.raises(ValueError):
-            model.sample(0, 0, 1)
+    def test_population_name(self):
 
-    def test_positional_samples_two_populations(self):
-        model = msprime.Demography.island_model(2, 1)
-        assert model.sample(1) == [msprime.Sample(0, 0)]
-        assert model.sample(0, 1) == [msprime.Sample(1, 0)]
-        assert model.sample(1, 1) == [msprime.Sample(0, 0), msprime.Sample(1, 0)]
-        assert model.sample(2, 0) == [msprime.Sample(0, 0), msprime.Sample(0, 0)]
-        # Drawing 0 samples is OK
-        assert model.sample(0) == []
-        assert model.sample(0, 0) == []
-        assert model.sample(3, 1) == [msprime.Sample(0, 0)] * 3 + [msprime.Sample(1, 0)]
+        demography = msprime.Demography.isolated_model([1])
+        assert demography.populations[0].name == "pop_0"
 
-    def test_positional_samples_n_populations(self):
-        for n in [1, 2, 3, 5]:
-            model = msprime.Demography.island_model(n, 1)
-            samples = model.sample(10)
-            assert samples == [msprime.Sample(0, 0)] * 10
-            samples = model.sample(*np.ones(n, dtype=int))
-            assert samples == [msprime.Sample(j, 0) for j in range(n)]
-            samples = model.sample(*np.zeros(n, dtype=int))
-            assert samples == []
-            samples = model.sample(*range(n))
-            assert samples == list(
-                itertools.chain(*[[msprime.Sample(j, 0)] * j for j in range(n)])
-            )
+        demography.populations[0].name = None
+        with pytest.raises(ValueError) as excinfo:
+            demography.validate()
+        assert "A population name must be set." in str(excinfo.value)
 
-    def test_keyword_sampling_errors(self):
-        model = msprime.Demography.island_model(2, 1)
-        model.populations[0].name = "A"
-        model.populations[1].name = "B"
+        for bad_identifier in ["", "x ", "x y"]:
+            demography.populations[0].name = bad_identifier
+            with pytest.raises(ValueError) as excinfo:
+                demography.validate()
+            msg = "A population name must be a valid Python identifier"
+            assert msg in str(excinfo.value)
+
+    def test_duplicate_population_name(self):
+        demography = msprime.Demography.isolated_model([1, 1])
+        demography.populations[1].name = "pop_0"
+        with pytest.raises(ValueError, match="Duplicate population name"):
+            demography.validate()
+
+    def test_population_name_map(self):
+        demography = msprime.Demography.isolated_model([1, 1])
+        assert demography.populations[0].name == "pop_0"
+        assert demography.populations[1].name == "pop_1"
+        # Looking up the name map before validate is
         with pytest.raises(ValueError):
-            # Sampling from no populations is an error (this is almost
-            # certainly a mistake by the user).
-            model.sample(**{})
-        for bad_sample in [{"A": 1, "B": -1}, {"A": -1}, {"A": 0, "B": -10}]:
-            with pytest.raises(ValueError):
-                model.sample(**bad_sample)
-        with pytest.raises(TypeError):
-            model.sample(A=6.6)
-        with pytest.raises(ValueError):
-            model.sample(C=1)
-        with pytest.raises(ValueError):
-            model.sample(**{"AC": 1})
+            demography.name_to_id("pop_0")
+        demography.validate()
+        with pytest.raises(KeyError):
+            demography.name_to_id("x")
+        assert demography.name_to_id("pop_0") == 0
+        assert demography.name_to_id("pop_1") == 1
 
-    def test_keyword_samples_two_populations(self):
-        model = msprime.Demography.island_model(2, 1)
-        model.populations[0].name = "A"
-        model.populations[1].name = "B"
-        assert model.sample(A=1) == [msprime.Sample(0, 0)]
-        assert model.sample(B=1) == [msprime.Sample(1, 0)]
-        assert model.sample(A=1, B=1) == [msprime.Sample(0, 0), msprime.Sample(1, 0)]
-        # Samples are returned **in the order specified**. This is guaranteed
-        # since Python 3.6
-        assert model.sample(B=1, A=1) == [msprime.Sample(1, 0), msprime.Sample(0, 0)]
-        assert model.sample(A=2, B=0) == [msprime.Sample(0, 0), msprime.Sample(0, 0)]
-        # Drawing 0 samples is OK
-        assert model.sample(A=0) == []
-        assert model.sample(B=0) == []
-        assert model.sample(A=0, B=0) == []
-        assert model.sample(A=3, B=1) == [msprime.Sample(0, 0)] * 3 + [
-            msprime.Sample(1, 0)
-        ]
-
-    def test_mixed_positional_and_keyword(self):
-        model = msprime.Demography.island_model(2, 1)
-        model.populations[0].name = "A"
-        model.populations[1].name = "B"
-        with pytest.raises(ValueError):
-            model.sample(0, A=1)
-
-    def test_simple_model(self):
-        demography = msprime.Demography.simple_model(2)
+    def test_isolated_model(self):
+        demography = msprime.Demography.isolated_model([2])
         assert demography.num_populations == 1
+        assert demography.num_events == 0
         assert demography.populations[0].initial_size == 2
         assert demography.populations[0].growth_rate == 0
 
-        demography = msprime.Demography.simple_model(2, 3)
+        demography = msprime.Demography.isolated_model([2], growth_rate=[3])
         assert demography.num_populations == 1
         assert demography.populations[0].initial_size == 2
         assert demography.populations[0].growth_rate == 3
 
-        demography = msprime.Demography.simple_model([3])
-        assert demography.num_populations == 1
-        assert demography.populations[0].initial_size == 3
-        assert demography.populations[0].growth_rate == 0
-
-        demography = msprime.Demography.simple_model([3], [4])
-        assert demography.num_populations == 1
-        assert demography.populations[0].initial_size == 3
-        assert demography.populations[0].growth_rate == 4
-
-        demography = msprime.Demography.simple_model([5, 6])
+        demography = msprime.Demography.isolated_model([5, 6])
         assert demography.num_populations == 2
         assert demography.populations[0].initial_size == 5
         assert demography.populations[0].growth_rate == 0
         assert demography.populations[1].initial_size == 6
         assert demography.populations[1].growth_rate == 0
 
-        demography = msprime.Demography.simple_model([5, 6], [7, 8])
+        demography = msprime.Demography.isolated_model([5, 6], growth_rate=[7, 8])
         assert demography.num_populations == 2
         assert demography.populations[0].initial_size == 5
         assert demography.populations[0].growth_rate == 7
         assert demography.populations[1].initial_size == 6
         assert demography.populations[1].growth_rate == 8
 
-    def test_simple_model_errors(self):
+    def test_isolated_model_errors(self):
         with pytest.raises(ValueError):
-            msprime.Demography.simple_model([[], []])
+            msprime.Demography.isolated_model([2, None])
         with pytest.raises(ValueError):
-            msprime.Demography.simple_model([1], [[], []])
+            msprime.Demography.isolated_model([2], growth_rate=[np.nan])
         with pytest.raises(ValueError):
-            msprime.Demography.simple_model([1], [])
+            msprime.Demography.isolated_model(2)
+        with pytest.raises(ValueError):
+            msprime.Demography.isolated_model([2], growth_rate=3)
+        with pytest.raises(ValueError):
+            msprime.Demography.isolated_model([[], []])
+        with pytest.raises(ValueError):
+            msprime.Demography.isolated_model([1], growth_rate=[[], []])
+        with pytest.raises(ValueError):
+            msprime.Demography.isolated_model([1], growth_rate=[])
+
+    def test_from_species_tree(self):
+        # basic checks here - indepth testing in the test_species_tree_parsing.py file.
+        demography = msprime.Demography.from_species_tree(
+            "(popA:10.0,popB:10.0)", initial_size=1000
+        )
+        assert isinstance(demography, msprime.Demography)
+        assert len(demography.populations) == 3
+        assert demography.populations[0].name == "popA"
+        assert demography.populations[0].initial_size == 1000
+        assert demography.populations[1].name == "popB"
+        assert demography.populations[0].initial_size == 1000
+        assert demography.populations[2].name == "pop_2"
+        assert demography.populations[2].initial_size == 1000
+        assert np.all(demography.migration_matrix == 0)
+        assert demography.num_events == len(demography.events)
+        assert len(demography.events) == 2
+        assert demography.events[0].time == 10
+        assert demography.events[0].source == 0
+        assert demography.events[0].dest == 2
+        assert demography.events[1].time == 10
+        assert demography.events[1].source == 1
+        assert demography.events[1].dest == 2
+
+    def test_from_starbeast(self):
+        with open("tests/data/species_trees/91genes_species_rev.tre") as f:
+            nexus = f.read()
+        demography = msprime.Demography.from_starbeast(nexus, 1)
+        assert isinstance(demography, msprime.Demography)
+        assert demography.populations[0].name == "spc12"
 
 
 class TestDemographyFromOldStyle:
@@ -3857,7 +4181,13 @@ class TestPopulationFromOldStyle:
     def test_defaults(self):
         pop_config = msprime.PopulationConfiguration()
         pop = msprime.Population.from_old_style(pop_config)
-        assert pop_config.initial_size == pop.initial_size
+        assert pop.initial_size == 1
+        assert pop_config.growth_rate == pop.growth_rate
+
+    def test_Ne(self):
+        pop_config = msprime.PopulationConfiguration()
+        pop = msprime.Population.from_old_style(pop_config, Ne=1234)
+        assert pop.initial_size == 1234
         assert pop_config.growth_rate == pop.growth_rate
 
     def test_values(self):

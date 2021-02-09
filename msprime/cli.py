@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2015-2020 University of Oxford
+# Copyright (C) 2015-2021 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -25,6 +25,7 @@ import os
 import random
 import signal
 import sys
+import warnings
 
 import tskit
 
@@ -54,7 +55,20 @@ mscompat_recombination_help = (
     "between the ends of the region being simulated; num_loci is the number "
     "of sites between which recombination can occur"
 )
-mscompat_gene_conversion_help = "TODO"
+mscompat_gene_conversion_help = (
+    "Gene conversion at rate gamma where gamma depends on the defined "
+    "recombination rate rho=4*N0*r. If rho > 0, gc_recomb_ratio defines the ratio "
+    "g/r, where r is the probability per generation of crossing-over and g the "
+    "corresponding gene conversion probability. Gene conversions are initiated at "
+    "rate gamma=rho*gc_recomb_ratio = 4*N0*r*gc_recomb_ratio. If rho = 0 the gene "
+    "conversion rate is given by gamma=gc_recomb_ratio=4*N0*c where c is the rate "
+    "of gene conversion initiation between the ends of the simulated region of "
+    "length num_loci. If the recombination rate is not specified, standard "
+    "parameters are used, i.e. rho = 0 and num_loci = 1. The length of the gene "
+    "conversion tracts is geometrically distributed with mean tract_length. "
+    "The mean tract_length needs to be larger than or equal to 1 for discrete "
+    "genomes and larger than 0 for continuous genomes."
+)
 mshotcompat_hotspot_help = (
     "Recombination hotspots defined according to the msHOT format. This is "
     "defined as a sequence: n (start stop scale)+ where n is the number of "
@@ -214,7 +228,7 @@ class SimulationRunner:
 
         if demography is None:
             # This is just used for testing so values don't really matter.
-            demography = msprime.Demography.simple_model(1)
+            demography = msprime.Demography.isolated_model([1])
 
         self.ms_random_seeds = ms_random_seeds
         if ms_random_seeds is None:
@@ -227,7 +241,7 @@ class SimulationRunner:
         # "invisible" recombination breakpoints, so we can't run simulations
         # the usual way via sim_ancestry.
         self.simulator = ancestry._parse_sim_ancestry(
-            samples=demography.sample(*num_samples),
+            samples=dict(enumerate(num_samples)),
             demography=demography,
             recombination_rate=recomb_map,
             gene_conversion_rate=gene_conversion_rate,
@@ -411,7 +425,7 @@ def create_simulation_runner(parser, arg_list):
     else:
         gc_rate = r * gc_param
 
-    demography = msprime.Demography.simple_model(1)
+    demography = msprime.Demography.isolated_model([1])
     # Check the structure format.
     symmetric_migration_rate = 0.0
     num_populations = 1
@@ -422,7 +436,7 @@ def create_simulation_runner(parser, arg_list):
         # We must have at least num_population sample_configurations
         if len(args.structure) < num_populations + 1:
             parser.error("Must have num_populations sample sizes")
-        demography = msprime.Demography.simple_model([1] * num_populations)
+        demography = msprime.Demography.isolated_model([1] * num_populations)
         num_samples = [0] * num_populations
         for j in range(num_populations):
             num_samples[j] = convert_int(args.structure[j + 1], parser)
@@ -616,8 +630,9 @@ def create_simulation_runner(parser, arg_list):
         if isinstance(msp_event, msprime.PopulationParametersChange):
             if msp_event.initial_size is not None:
                 msp_event.initial_size /= 2
-    for pop in demography.populations:
+    for j, pop in enumerate(demography.populations):
         pop.initial_size /= 2
+        pop.name = f"pop_{j}"
 
     runner = SimulationRunner(
         num_samples,
@@ -984,6 +999,12 @@ def mspms_main(arg_list=None):
 
 
 def run_simulate(args):
+
+    if args.compress:
+        warnings.warn(
+            "The --compress option is no longer supported and does nothing. "
+            "Please use the tszip utility to compress the output instead."
+        )
     tree_sequence = msprime.simulate(
         sample_size=int(args.sample_size),
         Ne=args.effective_population_size,
@@ -992,19 +1013,19 @@ def run_simulate(args):
         mutation_rate=args.mutation_rate,
         random_seed=args.random_seed,
     )
-    tree_sequence.dump(args.tree_sequence, zlib_compression=args.compress)
+    tree_sequence.dump(args.tree_sequence)
 
 
 def run_mutate(args):
     tree_sequence = tskit.load(args.tree_sequence)
-    tree_sequence = msprime.mutate(
+    tree_sequence = msprime.sim_mutations(
         tree_sequence=tree_sequence,
         rate=args.mutation_rate,
         random_seed=args.random_seed,
         keep=args.keep,
         start_time=args.start_time,
         end_time=args.end_time,
-        discrete=args.discrete,
+        discrete_genome=args.discrete_genome,
     )
     tree_sequence.dump(args.output_tree_sequence)
 
@@ -1042,7 +1063,7 @@ def add_mutate_subcommand(subparsers):
         help="Keep mutations in input tree sequence",
     )
     parser.add_argument(
-        "--discrete",
+        "--discrete-genome",
         action="store_true",
         default=False,
         help="Generate mutations at only integer positions along the genome. ",
@@ -1090,7 +1111,10 @@ def add_simulate_subcommand(subparsers) -> None:
     )
     add_random_seed_argument(parser)
     parser.add_argument(
-        "--compress", "-z", action="store_true", help="Enable zlib compression"
+        "--compress",
+        "-z",
+        action="store_true",
+        help="Deprecated option with no effect; please use the tszip utility instead.",
     )
     parser.set_defaults(runner=run_simulate)
 

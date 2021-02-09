@@ -26,6 +26,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import newick
 import numpy as np
@@ -48,7 +49,10 @@ def capture_output(func, *args, **kwargs):
     sys.stderr = buffer_class()
 
     try:
-        func(*args, **kwargs)
+        # Recent versions of MacOS seem to have issues with us calling signal
+        # during tests.
+        with mock.patch("signal.signal"):
+            func(*args, **kwargs)
         stdout_output = sys.stdout.getvalue()
         stderr_output = sys.stderr.getvalue()
     finally:
@@ -968,7 +972,7 @@ class TestMspmsOutput(TestCli):
         """
         sr = cli.SimulationRunner(
             num_samples=[sample_size],
-            demography=msprime.Demography.simple_model(1),
+            demography=msprime.Demography.isolated_model([1]),
             num_loci=num_loci,
             recombination_rate=recombination_rate,
             num_replicates=num_replicates,
@@ -1265,14 +1269,23 @@ class TestMspSimulateOutput(unittest.TestCase):
 
     def test_simulate_short_args(self):
         cmd = "simulate"
-        stdout, stdearr = capture_output(
+        stdout, stderr = capture_output(
             cli.msp_main,
             [cmd, "100", self._tree_sequence, "-L", "1e2", "-r", "5", "-u", "2"],
         )
         tree_sequence = tskit.load(self._tree_sequence)
+        assert len(stderr) == 0
+        assert len(stdout) == 0
         assert tree_sequence.get_sample_size() == 100
         assert tree_sequence.get_sequence_length() == 100
         assert tree_sequence.get_num_mutations() > 0
+
+    def test_compress_warns(self):
+        cmd = "simulate"
+        with pytest.warns(UserWarning):
+            capture_output(cli.msp_main, [cmd, "10", self._tree_sequence, "--compress"])
+        tree_sequence = tskit.load(self._tree_sequence)
+        assert tree_sequence.get_sample_size() == 10
 
 
 class TestMspConversionOutput(unittest.TestCase):

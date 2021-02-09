@@ -740,11 +740,13 @@ class TestSimulationState(LowLevelTestCase):
             self.verify_completed_simulation(sim)
             sim.reset()
 
+    @pytest.mark.slow
     def test_random_sims(self):
         num_random_sims = 10
         for j in range(num_random_sims):
             self.verify_random_parameters(j)
 
+    @pytest.mark.slow
     def test_small_sims(self):
         self.verify_simulation(3, 1, 0.0)
         self.verify_simulation(3, 100, 0.0)
@@ -2409,7 +2411,7 @@ class TestSimMutations:
                     random_generator=rng,
                     rate_map=rate_map,
                     model=model,
-                    discrete_sites=bad_type,
+                    discrete_genome=bad_type,
                 )
         assert (
             _msprime.sim_mutations(
@@ -2433,7 +2435,7 @@ class TestSimMutations:
         generate()
         for bad_type in [[], None, "asdf"]:
             with pytest.raises(TypeError):
-                generate(discrete_sites=bad_type)
+                generate(discrete_genome=bad_type)
             with pytest.raises(TypeError):
                 generate(keep=bad_type)
             with pytest.raises(TypeError):
@@ -2560,8 +2562,9 @@ class TestSimMutations:
         tables = tskit.TableCollection(1)
         tables.nodes.add_row(0)
         tables.sites.add_row(0, "a")
-        for _ in range(8192):
+        for _ in range(4096):
             tables.mutations.add_row(0, node=0, time=0, derived_state="b")
+            tables.mutations.add_row(0, node=0, time=0, derived_state="c")
         tables.build_index()
         tables.compute_mutation_parents()
         self.verify_block_size(tables)

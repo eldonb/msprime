@@ -200,6 +200,12 @@ msp_strerror_internal(int err)
                   "existing mutations: finite site mutations must be generated on "
                   "older time periods first.";
             break;
+        case MSP_ERR_BAD_ANCESTRAL_MUTATION:
+            ret = "The ancestral mutations added resulted in a silent transition "
+                  "(e.g. A -> A) which is not permitted by tskit. Please open an "
+                  "issue at https://github.com/tskit-dev/msprime/issues if you "
+                  "encounter this problem.";
+            break;
         case MSP_ERR_INSUFFICIENT_ALLELES:
             ret = "Must have at least two alleles.";
             break;
@@ -263,7 +269,8 @@ msp_strerror_internal(int err)
             ret = "Only isolated sample nodes are supported as ancient samples";
             break;
         case MSP_ERR_UNKNOWN_TIME_NOT_SUPPORTED:
-            ret = "Kept mutations must have known mutation times.";
+            ret = "Kept mutations must have known mutation times (which can be added "
+                  "using compute_mutation_times).";
             break;
         case MSP_ERR_DTWF_DIPLOID_ONLY:
             ret = "The DTWF model only supports ploidy = 2";

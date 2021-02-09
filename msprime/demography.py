@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2015-2020 University of Oxford
+# Copyright (C) 2015-2021 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -19,28 +19,29 @@
 """
 Module responsible for defining and debugging demographic models.
 """
+from __future__ import annotations
+
 import collections
+import dataclasses
 import inspect
-import io
-import json
 import logging
 import math
 import sys
+import textwrap
 import warnings
+from typing import ClassVar
+from typing import List
+from typing import Union
 
-import attr
 import numpy as np
+import tskit
 
 from . import ancestry
+from . import core
+from . import species_trees
 
 
 logger = logging.getLogger(__name__)
-
-
-# TODO can we change this to be an attrs object instead?
-# Yes, we just need to make sure that we support tuples as input also
-# to preserve backwards compatability.
-Sample = collections.namedtuple("Sample", ["population", "time"])
 
 
 def check_num_populations(num_populations):
@@ -67,29 +68,211 @@ def check_population_size(Ne):
         raise ValueError("Population size must be positive")
 
 
-@attr.s(eq=False)
+@dataclasses.dataclass
 class Demography:
     """
     A description of a demographic model for an msprime simulation.
 
     TODO document properly.
+
+    Population structure is modelled by specifying a fixed number of
+    subpopulations :math:`d`, and a :math:`d \\times d` matrix :math:`M` of
+    per-generation migration rates. The :math:`(j,k)^{th}` entry of :math:`M`
+    is the expected number of migrants moving from population :math:`k` to
+    population :math:`j` per generation, divided by the size of population
+    :math:`j`. In terms of the coalescent process, :math:`M_{j,k}` gives the
+    rate at which an ancestral lineage moves from population :math:`j` to
+    population :math:`k`, as one follows it back through time. In
+    continuous-time models, when :math:`M_{j,k}` is close to zero, this rate is
+    approximately equivalent to the fraction of population :math:`j` that is
+    replaced each generation by migrants from population :math:`k`. In
+    discrete-time models, the equivalence is exact and each row of :math:`M`
+    has the constraint :math:`\\sum_{k \\neq j} M_{j,k} \\leq 1`. This differs
+    from the migration matrix one usually uses in population demography: if
+    :math:`m_{k,j}` is the proportion of individuals (in the usual sense; not
+    lineages) in population :math:`k` that move to population :math:`j` per
+    generation, then translating this proportion of population :math:`k` to a
+    proportion of population :math:`j`, we have :math:`M_{j,k} = m_{k,j}
+    \\times N_k / N_j`.
+
+    Each subpopulation has an initial absolute population size :math:`s`
+    and a per generation exponential growth rate :math:`\\alpha`. The size of a
+    given population at time :math:`t` in the past (measured in generations) is
+    therefore given by :math:`s e^{-\\alpha t}`. Demographic events that occur in
+    the history of the simulated population alter some aspect of this population
+    configuration at a particular time in the past.
+
     """
 
-    populations = attr.ib(factory=list)
-    migration_matrix = attr.ib(default=None)
-    events = attr.ib(factory=list)
+    populations: List[Population] = dataclasses.field(default_factory=list)
+    events: List = dataclasses.field(default_factory=list)
+    migration_matrix: Union[np.ndarray, None] = None
 
-    def __attrs_post_init__(self):
+    def __post_init__(self):
         if self.migration_matrix is None:
             N = self.num_populations
             self.migration_matrix = np.zeros((N, N))
 
         # Sort demographic events by time.
         self.events.sort(key=lambda de: de.time)
+        self.__name_id_map = None
+
+    def _populations_table(self):
+        col_titles = [
+            "id",
+            "name",
+            "description",
+            "initial_size",
+            "growth_rate",
+            "extra_metadata",
+        ]
+        data = []
+        for j, pop in enumerate(self.populations):
+            row = [str(j)] + [f"{getattr(pop, attr)}" for attr in col_titles[1:]]
+            data.append(row)
+        return col_titles, data
+
+    def _populations_text(self):
+        col_titles, data = self._populations_table()
+        alignments = ["^", "<", "<", "<", "^", "<"]
+        data = [
+            [
+                [item.as_text() if isinstance(item, core.TableEntry) else item]
+                for item in row
+            ]
+            for row in data
+        ]
+        return core.text_table(
+            "Populations", [[title] for title in col_titles], alignments, data
+        )
+
+    def _populations_html(self):
+        col_titles, data = self._populations_table()
+        return core.html_table("Populations", col_titles, data)
+
+    def _migration_rate_info(self, source, dest, rate):
+        extra = None
+        if source != dest:
+            extra = (
+                "Backwards in time migration rate from population "
+                f"{self.populations[source].name} to {self.populations[dest].name} "
+                f"= {rate} per generation. "
+                "Equivalant to **IMPLEMENT ME** forwards in time"
+            )
+        return core.TableEntry(f"{rate:.4g}", extra)
+
+    def _migration_matrix_table(self):
+        col_titles = [""] + [pop.name for pop in self.populations]
+        data = []
+        for j in range(self.num_populations):
+            row = [self.populations[j].name] + [
+                self._migration_rate_info(j, k, self.migration_matrix[j, k])
+                for k in range(self.num_populations)
+            ]
+            data.append(row)
+        return col_titles, data
+
+    def _migration_matrix_text(self):
+        col_titles, data = self._migration_matrix_table()
+        alignments = ">" + "^" * self.num_populations
+        data = [
+            [
+                [item.as_text() if isinstance(item, core.TableEntry) else item]
+                for item in row
+            ]
+            for row in data
+        ]
+        return core.text_table(
+            "Migration Matrix", [[title] for title in col_titles], alignments, data
+        )
+
+    def _migration_matrix_html(self):
+        col_titles, data = self._migration_matrix_table()
+        return core.html_table("Migration matrix", col_titles, data)
+
+    def _events_text(self, events, title="Events"):
+        col_titles = [["time"], ["type"], ["parameters"], ["effect"]]
+        alignments = "><<<"
+        data = []
+        for event in events:
+            type_text = textwrap.wrap(event._type_str, 15)
+            description = textwrap.wrap(event._parameters(), 20)
+            effect = textwrap.wrap(event._effect(), 38)
+            row = [[f"{event.time:.4g}"], type_text, description, effect]
+            data.append(row)
+        return core.text_table(
+            title, col_titles, alignments, data, internal_hlines=True
+        )
+
+    def _events_html(self, events, title="Events"):
+        col_titles = ["time", "type", "parameters", "effect"]
+        data = []
+        for event in events:
+            class_name = event.__class__.__name__
+            # TODO change this to stable when 1.0 is released.
+            type_html = (
+                "<a href='https://tskit.dev/msprime/docs/latest/api.html#msprime."
+                f"{class_name}'>{event._type_str}</a>"
+            )
+            row = [f"{event.time:.4g}", type_html, event._parameters(), event._effect()]
+            data.append(row)
+        return core.html_table(title, col_titles, data)
+
+    def _repr_html_(self):
+        return (
+            "<p>"
+            + self._populations_html()
+            + self._migration_matrix_html()
+            + self._events_html(self.events)
+            + "</p>"
+        )
+
+    def __str__(self):
+        populations = self._populations_text()
+        migration_matrix = self._migration_matrix_text()
+        events = self._events_text(self.events)
+
+        def indent(table):
+            lines = table.splitlines()
+            s = "╟  " + lines[0] + "\n"
+            for line in lines[1:]:
+                s += "║  " + line + "\n"
+            return s
+
+        s = (
+            "Demography\n"
+            + indent(populations)
+            + indent(migration_matrix)
+            + indent(events)
+        )
+        return s
+
+    def name_to_id(self, name):
+        """
+        Returns the integer ID (i.e., its position in the list of populations)
+        of the population with the specified name. If the name does not exist,
+        raise a KeyError.
+
+        Note: this function will raise an error if called before the ``validate``
+        method is called.
+
+        :param str name: The name of the population we wish to look up.
+        :return: The integer ID of the population.
+        :rtype: int
+        """
+        if self.__name_id_map is None:
+            raise ValueError("Cannot call name_to_id before calling validate()")
+        if name not in self.__name_id_map:
+            raise KeyError(f"Population with name '{name}' not found in demography")
+        return self.__name_id_map[name]
 
     @property
     def num_populations(self):
         return len(self.populations)
+
+    @property
+    def num_events(self):
+        return len(self.events)
 
     def validate(self):
         """
@@ -114,94 +297,66 @@ class Demography:
                     "Demographic events must be a list of DemographicEvent "
                     "instances sorted in non-decreasing order of time."
                 )
-        for population in self.populations:
+
+        self.__name_id_map = {}
+        for j, population in enumerate(self.populations):
             population.validate()
+            if population.name in self.__name_id_map:
+                raise ValueError(f"Duplicate population name: '{population.name}'")
+            self.__name_id_map[population.name] = j
 
     def insert_populations(self, tables):
         """
         Insert population definitions for this demography into the specified
         set of tables.
         """
+        metadata_schema = tskit.MetadataSchema(
+            {
+                "codec": "json",
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": ["string", "null"]},
+                },
+                # The name and description fields are always filled out by
+                # msprime, so we tell downstream tools this by making them
+                # "required" by the schema.
+                "required": ["name", "description"],
+                "additionalProperties": True,
+            }
+        )
         assert len(tables.populations) == 0
+        tables.populations.metadata_schema = metadata_schema
         for population in self.populations:
-            tables.populations.add_row(metadata=population.temporary_hack_for_metadata)
-
-    def sample(self, *args, **kwargs):
-        """
-
-        Returns a list of :class:`.Sample` objects, with the number of samples
-        from each population determined by either the positional or keyword
-        arguments. The keyword and positional forms cannot be mixed.
-
-        Positional arguments are intepreted as the number of samples to draw
-        from the corresponding population index. For example,
-        ``demography.sample.(2, 5, 7)`` returns a list of 14 samples, two of
-        which are from the model's first population, five from the  second
-        population, and seven from the third. The number of positional
-        arguments must be less than or equal to the number of populations. If
-        the number of arguments is less than the number of populations, then
-        remaining samples sizes are treated as zero. For example, in a two
-        population model, ``demography.sample(5)`` is equivalent to
-        ``demography.sample(5, 0)``.
-
-        Samples can also be generated based on the population's name
-        using keyword arguments. For example, if we have a demographic
-        model with three populations named "X", "Y", and "Z" we can
-        use ``demography.sample(X=1, Y=2, Z=3)`` will return six samples:
-        one for the population named "X", two for "Y" and three for "Z".
-
-        The list of :class:`.Sample` objects returned is always grouped
-        by population. In the positional case, population IDs in
-        nondecreasing numerical order. When the keyword form is used,
-        samples are returned in the order in which they were specified.
-        Thus, the list returned by ``demography.sample(A=1, B=2)``
-        will have one sample for population "A", followed by two samples
-        for population "B". This is true regardless of the numerical
-        population IDs for these populations.
-
-        :return: A list of :class:`.Sample` instances.
-        :rtype: list(.Sample)
-        """
-        if len(args) == 0 and len(kwargs) == 0:
-            raise ValueError("Must specify at least one population to sample from")
-        # Don't allow mixed kwd and positional for now, as it's easier to
-        # document.
-        if len(args) > 0 and len(kwargs) > 0:
-            raise ValueError("Cannot mix keyword and positional arguments")
-        if len(args) > self.num_populations:
-            raise ValueError(
-                f"Cannot specify more than {self.num_populations} populations "
-                "to sample from"
-            )
-
-        def check_num_samples(n):
-            if n < 0:
-                raise ValueError("Cannot have negative numbers of samples")
-
-        samples = []
-        for pop_index, n in enumerate(args):
-            # TODO we're assuming that samples are all at time 0 for now.
-            check_num_samples(n)
-            sample = Sample(pop_index, time=0)
-            samples.extend([sample] * n)
-        name_index_map = {
-            self.populations[j].name: j for j in range(self.num_populations)
-        }
-        for pop_name, n in kwargs.items():
-            check_num_samples(n)
-            if pop_name not in name_index_map:
-                # TODO should this be a KeyError/LookupError?
-                raise ValueError("No population with name {pop_name} in this model")
-            pop_index = name_index_map[pop_name]
-            sample = Sample(pop_index, time=0)
-            samples.extend([sample] * n)
-        return samples
+            metadata = {
+                "name": population.name,
+                "description": population.description,
+            }
+            if population.extra_metadata is not None:
+                intersection = set(population.extra_metadata.keys()) & set(
+                    metadata.keys()
+                )
+                if len(intersection) > 0:
+                    printed_list = list(sorted(intersection))
+                    raise ValueError(
+                        f"Cannot set standard metadata key(s) {printed_list} "
+                        "using extra_metadata. Please set using the corresponding "
+                        "property of the Population class."
+                    )
+                metadata.update(population.extra_metadata)
+            tables.populations.add_row(metadata=metadata)
 
     def asdict(self):
-        return attr.asdict(self)
+        return dataclasses.asdict(self)
 
     def debug(self):
-        return DemographyDebugger(self)
+        """
+        Returns a :class:`.DemographyDebugger` instance for this demography.
+
+        :return: A DemographyDebugger object for this demography.
+        :rtype: .DemographyDebugger
+        """
+        return DemographyDebugger(demography=self)
 
     def __eq__(self, other):
         if isinstance(other, Demography):
@@ -214,8 +369,157 @@ class Demography:
             return super().__eq__(other)
 
     @staticmethod
+    def from_species_tree(
+        tree,
+        initial_size,
+        *,
+        time_units="gen",
+        generation_time=None,
+        growth_rate=None,
+    ):
+        """
+        Parse a species tree in `Newick
+        <https://en.wikipedia.org/wiki/Newick_format>`_ format and return the
+        corresponding :class:`Demography` object. The tree is assumed to be
+        rooted and ultrametric and branch lengths must be included and
+        correspond to time, either in units of millions of years, years, or
+        generations.
+
+        The returned :class:`.Demography` object contains a
+        :class:`.Population` for each node in the species tree. The
+        population's ``name`` attribute will be either the corresponding node
+        label from the newick tree, if it exists, or otherwise the name takes
+        the form "pop_{j}", where j is the position of the given population in
+        the list. Leaf populations are first in the list, and added in
+        left-to-right order. Populations corresponding to the internal nodes
+        are then added in a postorder traversal of the species tree. For each
+        internal node, :class:`.MassMigration` events are added so that
+        lineages move from its child populations at the appropriate time.
+
+        :warning: If continuous migration is added to the returned Demography
+            by updating the migration matrix, it is important to
+            note that the MassMigration events used to move lineages do *not*
+            alter migration rates, and it should be ensured that
+            migration rates to source populations of mass migration events are zero
+            after the mass migration (viewed backwards in time).
+
+        :todo: Implement the PopulationSplit event and document its use here.
+            We'll still need to put in a warning, so users know that the migration
+            matrix will be updated at every node.
+
+        The initial sizes and growth rates for the populations in the model are
+        set via the ``initial_size`` and ``growth_rate`` arguments. These can be
+        specified in two ways: if a single number is provided, this is used
+        for all populations. The argument may also be a mapping from population
+        names to their respective values. For example:
+
+        .. code-block:: python
+
+            tree = "(A:10.0,B:10.0)C"
+            initial_size = {"A": 1000, "B": 2000, "C": 100}
+            demography = msprime.Demography.from_species_tree(tree, initial_size)
+
+        Note that it is possible to have default population sizes for unnamed
+        ancestral populations using a `collections.defaultdict`, e.g.,
+
+        .. code-block:: python
+
+            tree = "(A:10.0,B:10.0)"
+            initial_size = collections.defaultdict(lambda: 100)
+            initial_size.update({"A": 1000, "B": 2000})
+            demography = msprime.Demography.from_species_tree(tree, initial_size)
+
+        :param str tree: The tree string in Newick format, with named leaves and branch
+            lengths.
+        :param initial_size: Each population's initial_size. May be a single number
+            or a mapping from population names to their sizes.
+        :param growth_rate: Each population's growth_rate. May be a single number
+            or a mapping from population names to their exponential growth rates.
+            Defaults to zero.
+        :param str time_units: The units of time in which the species tree's
+            branch lengths are measured. Allowed branch length units are millions of
+            years, years, and generations; these should be specified with the strings
+            ``"myr"``, ``"yr"``, or ``"gen"``, respectively. This defaults to
+            ``"gen"``.
+        :param float generation_time: The number of years per generation. If and only
+            if the branch lengths are not in units of generations, the generation time
+            must be specified. This defaults to `None`.
+        :return: A Demography object representing the specified species tree.
+        :rtype: .Demography
+        """
+        return species_trees.parse_species_tree(
+            tree,
+            initial_size=initial_size,
+            growth_rate=growth_rate,
+            time_units=time_units,
+            generation_time=generation_time,
+        )
+
+    @staticmethod
+    def from_starbeast(tree, generation_time, time_units="myr"):
+        """
+        Parse a species tree produced by the program `TreeAnnotator
+        <https://www.beast2.org/treeannotator>`_
+        based on a posterior tree distribution generated with `StarBEAST
+        <https://academic.oup.com/mbe/article/34/8/2101/3738283>`_  and return
+        the corresponding Demography object.
+
+        Species trees produced by TreeAnnotator are written in `Nexus
+        <https://en.wikipedia.org/wiki/Nexus_file>`_ format and are rooted,
+        bifurcating, and ultrametric. Branch lengths usually are in units of
+        millions of years, but the use of other units is permitted by StarBEAST
+        (and thus TreeAnnotator). This function allows branch length units of
+        millions of years or years. Leaves must be named and the tree must
+        include information on population sizes of leaf and ancestral species
+        in the form of annotation with the "dmv" tag, which is the case for
+        trees written by TreeAnnotator based on StarBEAST posterior tree
+        distributions.
+
+        The returned :class:`.Demography` object contains a :class:`.Population` for
+        each node in the species tree. The population's ``name`` attribute will
+        be either the corresponding node label from the newick tree, if it exists,
+        or otherwise the name takes the form "pop_{j}", where j is the position
+        of the given population in the list. Leaf populations are first in the
+        list, and added in left-to-right order. Populations corresponding to the
+        internal nodes are then added in a postorder traversal of the species
+        tree. For each internal node, :class:`.MassMigration` events are added
+        so that lineages move from its child populations at the appropriate time.
+
+        :warning: If continuous migration is added to the returned Demography
+            by updating the migration matrix, it is important to
+            note that the MassMigration events used to move lineages do *not*
+            alter migration rates, and it should be ensured that
+            migration rates to source populations of mass migration events are zero
+            after the mass migration (viewed backwards in time).
+
+        :todo: Implement the PopulationSplit event and document its use here.
+            We'll still need to put in a warning, so users know that the migration
+            matrix will be updated at every node.
+
+        :param str tree: The tree string in Nexus format, with named leaves, branch
+            lengths, and branch annotation. Typically, this string is the entire content
+            of a file written by TreeAnnotator.
+        :param float generation_time: The number of years per generation.
+        :param str time_units: The units of time in which the species tree's
+            branch lengths are measured. Allowed branch length units are millions of
+            years, and years; these should be specified with the strings ``"myr"`` or
+            ``"yr"``, respectively. This defaults to ``"myr"``.
+        :return: A :class:`.Demography` instance that describing the information in the
+            specified species tree.
+        :rtype: .Demography
+        """
+        return species_trees.parse_starbeast(
+            tree=tree,
+            generation_time=generation_time,
+            time_units=time_units,
+        )
+
+    @staticmethod
     def from_old_style(
-        population_configurations=None, migration_matrix=None, demographic_events=None
+        population_configurations=None,
+        migration_matrix=None,
+        demographic_events=None,
+        Ne=1,
     ):
         """
         Creates a Demography object from the pre 1.0 style input parameters,
@@ -223,10 +527,13 @@ class Demography:
         """
         demography = Demography()
         if population_configurations is None:
-            demography.populations = [Population()]
+            demography.populations = [Population(initial_size=Ne)]
         else:
             for pop_config in population_configurations:
-                demography.populations.append(Population.from_old_style(pop_config))
+                demography.populations.append(Population.from_old_style(pop_config, Ne))
+        for j, population in enumerate(demography.populations):
+            if population.name is None:
+                population.name = f"pop_{j}"
         if migration_matrix is None:
             migration_matrix = np.zeros(
                 (demography.num_populations, demography.num_populations)
@@ -236,27 +543,45 @@ class Demography:
             demography.events = demographic_events
         return demography
 
-    # TODO give this a better name and document it.
-    # What about "isolated" as it gives an easy way of describing isolated pops?
-    def simple_model(initial_size=1, growth_rate=None):
+    @staticmethod
+    def isolated_model(initial_size, *, growth_rate=None):
         """
-        Returns a simple single-population model.
+        Returns a :class:`.Demography` object representing a collection of
+        isolated populations with specified initial population sizes and
+        growth rates. Please see :ref:`sec_demography` for more details on
+        population sizes and growth rates.
+
+        :param array_like initial_size: the ``initial_size`` value for each
+            of the :class:`.Population` in the returned model. The length
+            of the array corresponds to the number of populations.
+            model.
+        :param array_like growth_rate: The exponential growth rate for each
+            population. Must be either None (the default, resulting a zero
+            growth rate) or an array with the same length as ``initial_size``.
+        :return: A Demography object representing this model, suitable as
+            input to :func:`.simulate`.
+        :rtype: .Demography
         """
-        initial_size = np.array(initial_size, ndmin=1)
+        initial_size = np.array(initial_size, dtype=np.float64)
         if len(initial_size.shape) != 1:
             raise ValueError(
-                "The initial_size argument must be scalar value or an "
-                "1D array of population size values"
+                "The initial_size argument must a 1D array of population size values"
             )
         if growth_rate is None:
             growth_rate = np.zeros_like(initial_size)
         else:
-            growth_rate = np.array(growth_rate, ndmin=1)
+            growth_rate = np.array(growth_rate, dtype=np.float64)
         if initial_size.shape != growth_rate.shape:
             raise ValueError(
                 "If growth_rate is specified it must be a 1D array of the same "
                 "length as the population_size array"
             )
+        if np.any(initial_size < 0):
+            raise ValueError("population size values must be nonnegative.")
+        if not np.all(np.isfinite(initial_size)):
+            raise ValueError("population size values must be finite.")
+        if not np.all(np.isfinite(growth_rate)):
+            raise ValueError("growth_rate values must be finite.")
         populations = [
             Population(
                 initial_size=initial_size[j],
@@ -268,75 +593,79 @@ class Demography:
         return Demography(populations=populations)
 
     @staticmethod
-    def island_model(num_populations, migration_rate, Ne=1):
+    def island_model(initial_size, migration_rate, *, growth_rate=None):
         """
-        Returns a :class:`.Demography` object with the specified number of
-        populations with symmetric migration between all pairs of populations
-        at the specified rate.
+        Returns a :class:`.Demography` object representing a collection of
+        populations with specified initial population sizes and growth
+        rates, with symmetric migration between each pair of populations at the
+        specified rate. Please see :ref:`sec_demography` for more details on
+        population sizes and growth rates.
 
-        :param int num_populations: The number of populations in this Island
+        :param array_like initial_size: the ``initial_size`` value for each
+            of the :class:`.Population` in the returned model. The length
+            of the array corresponds to the number of populations.
             model.
         :param float migration_rate: The migration rate between each pair of
             populations.
-        :param float Ne: The initial size of each population. Defaults to 1.
+        :param array_like growth_rate: The exponential growth rate for each
+            population. Must be either None (the default, resulting a zero
+            growth rate) or an array with the same length as ``initial_size``.
         :return: A Demography object representing this model, suitable as
             input to :func:`.simulate`.
         :rtype: .Demography
         """
-        check_num_populations(num_populations)
+        model = Demography.isolated_model(initial_size, growth_rate=growth_rate)
         check_migration_rate(migration_rate)
-        check_population_size(Ne)
-
-        model = Demography()
-        model.populations = [
-            # TODO add names/metadata here.
-            Population(initial_size=Ne, name=f"pop_{j}")
-            for j in range(num_populations)
-        ]
-        model.migration_matrix = np.full(
-            (num_populations, num_populations), migration_rate
-        )
+        model.migration_matrix[:] = migration_rate
         np.fill_diagonal(model.migration_matrix, 0)
         return model
 
-    # FIXME change Ne to population_size.
     @staticmethod
-    def stepping_stone_1d(num_populations, migration_rate, Ne=1, circular=True):
+    def stepping_stone_model(
+        initial_size, migration_rate, *, growth_rate=None, boundaries=False
+    ):
         """
-        Returns a :class:`.Demography` object describing a 1 dimensional
-        stepping stone model where adjacent populations exchange migrants at
-        the specified rate.
+        Returns a :class:`.Demography` object representing a collection of
+        populations with specified initial population sizes and growth
+        rates, in which adjacent demes exchange migrants at the
+        specified rate. Please see :ref:`sec_demography` for more details on
+        population sizes and growth rates.
 
-        :param int num_populations: The number of populations in this Island
-            model.
-        :param float migration_rate: The migration rate between each pair of
-            populations.
-        :param float Ne: The initial size of each of the populations. Defaults
-             to 1.
-        :param bool circular: If True (the default) the stepping stone model is
-            circular, so that migration occurs between the first and last
-            populations. If False, no migration occurs.
+        .. note:: The current implementation on supports a one-dimensional stepping
+            stone model, but higher dimensions could also be supported. Please
+            open an issue on GitHub if this feature would be useful to you.
+
+        :param array_like initial_size: the ``initial_size`` value for each
+            of the :class:`.Population` in the returned model. The length
+            of the array corresponds to the number of populations.
+        :param float migration_rate: The migration rate between adjacent pairs
+            of populations.
+        :param array_like growth_rate: The exponential growth rate for each
+            population. Must be either None (the default, resulting a zero
+            growth rate) or an array with the same length as ``initial_size``.
+        :param bool boundaries: If True the stepping stone model has boundary
+            conditions imposed so that demes at either end of the chain do
+            not exchange migrats. If False (the default), the set of
+            populations is "circular" and migration takes place between the
+            terminal demes.
         :return: A Demography object representing this model, suitable as
             input to :func:`.simulate`.
         :rtype: .Demography
         """
-        check_num_populations(num_populations)
+        initial_size = np.array(initial_size, dtype=np.float64)
+        if len(initial_size.shape) > 1:
+            raise ValueError(
+                "Only 1D stepping stone models currently supported. Please open "
+                "an issue on GitHub if you would like 2D (or more) models"
+            )
+        model = Demography.isolated_model(initial_size, growth_rate=growth_rate)
         check_migration_rate(migration_rate)
-        check_population_size(Ne)
-
-        model = Demography()
-        model.populations = [
-            # TODO add names/metadata here.
-            Population(initial_size=Ne)
-            for _ in range(num_populations)
-        ]
-        model.migration_matrix = np.zeros((num_populations, num_populations))
-        if num_populations > 1:
-            index1 = np.arange(num_populations, dtype=int)
-            index2 = np.mod(index1 + 1, num_populations)
+        if model.num_populations > 1:
+            index1 = np.arange(model.num_populations, dtype=int)
+            index2 = np.mod(index1 + 1, model.num_populations)
             model.migration_matrix[index1, index2] = migration_rate
             model.migration_matrix[index2, index1] = migration_rate
-            if not circular:
+            if boundaries:
                 model.migration_matrix[0, -1] = 0
                 model.migration_matrix[-1, 0] = 0
         return model
@@ -439,15 +768,12 @@ class Demography:
 # structure and how you sample from it.
 
 
-@attr.s
+@dataclasses.dataclass
 class Population:
     """
     Define a single population in a simulation.
 
-    :ivar initial_size: The absolute size of the population at time
-        zero. If not specified, or None, when the :class:`.Demography`
-        object is passed to the ``demography`` argument to :func:`.simulate`
-        the default effective population size ``Ne`` will be used.
+    :ivar initial_size: The absolute size of the population at time zero.
     :vartype initial_size: float
     :var growth_rate: The exponential growth rate of the
         population per generation (forwards in time).
@@ -462,46 +788,52 @@ class Population:
     :vartype description: str
     """
 
-    initial_size = attr.ib(default=None)
-    growth_rate = attr.ib(default=0.0)
-    name = attr.ib(default=None)
-    description = attr.ib(default=None)
-
-    # TODO add extra metadata when we bring in tskit 0.3. We should always
-    # have the name and description, and other metadata items can optionally
-    # be declared and added. For now, let's keep the metadata style introduced
-    # in 0.7.4 working.
-    temporary_hack_for_metadata = attr.ib(default=None)
-
-    def temporary_hack_for_encoding_old_style_metadata(self):
-        encoded_metadata = b""
-        if self.temporary_hack_for_metadata is not None:
-            encoded_metadata = json.dumps(self.temporary_hack_for_metadata).encode()
-        return encoded_metadata
+    initial_size: float
+    growth_rate: float = 0.0
+    name: Union[str, None] = None
+    description: Union[str, None] = None
+    extra_metadata: dict = dataclasses.field(default_factory=dict)
+    sampling_time: float = 0
 
     def asdict(self):
-        return attr.asdict(self)
+        return dataclasses.asdict(self)
 
     @staticmethod
-    def from_old_style(pop_config):
+    def from_old_style(pop_config, Ne=1):
         """
         Returns a Population object derived from the specified old-style
-        PopulationConfiguration.
+        PopulationConfiguration. The Ne value is used as the ``initial_size``
+        if this is not provided in the PopulationConfiguration.
         """
-        return Population(
-            initial_size=pop_config.initial_size,
-            growth_rate=pop_config.growth_rate,
-            temporary_hack_for_metadata=pop_config.metadata,
+        initial_size = (
+            Ne if pop_config.initial_size is None else pop_config.initial_size
         )
+        population = Population(
+            initial_size=initial_size,
+            growth_rate=pop_config.growth_rate,
+        )
+        metadata = pop_config.metadata
+        if metadata is not None and isinstance(metadata, collections.abc.Mapping):
+            metadata = metadata.copy()
+            if "name" in metadata:
+                population.name = metadata.pop("name")
+            if "description" in metadata:
+                population.description = metadata.pop("description")
+        population.extra_metadata = metadata
+        return population
 
     def validate(self):
-        # TODO more checks, and put in population ID/names
+        # TODO more checks
         if self.initial_size < 0:
             raise ValueError("Negative population size")
+        if self.name is None:
+            raise ValueError("A population name must be set.")
+        if not self.name.isidentifier():
+            raise ValueError("A population name must be a valid Python identifier")
 
 
 # This was lifted out of older code as-is. No point in updating it
-# to use attrs, since all we want to do is maintain compatability
+# to use dataclasses, since all we want to do is maintain compatability
 # with older code.
 class PopulationConfiguration:
     """
@@ -546,13 +878,19 @@ class PopulationConfiguration:
         )
 
 
-@attr.s
+@dataclasses.dataclass
 class DemographicEvent:
     """
     Superclass of demographic events that occur during simulations.
     """
 
-    time = attr.ib()
+    time: float
+
+    def _parameters(self):
+        raise NotImplementedError()
+
+    def _effect(self):
+        raise NotImplementedError()
 
     def asdict(self):
         return {
@@ -562,7 +900,7 @@ class DemographicEvent:
         }
 
 
-@attr.s
+@dataclasses.dataclass
 class PopulationParametersChange(DemographicEvent):
     """
     Changes the demographic parameters of a population at a given time.
@@ -584,15 +922,17 @@ class PopulationParametersChange(DemographicEvent):
         simultaneously.
     """
 
-    initial_size = attr.ib(default=None)
-    growth_rate = attr.ib(default=None)
+    initial_size: Union[float, None] = None
+    growth_rate: Union[float, None] = None
     # TODO change the default to -1 to match MigrationRateChange.
-    population = attr.ib(default=None)
+    population: Union[int, None] = None
     # Deprecated.
     # TODO add a formal deprecation notice
-    population_id = attr.ib(default=None, repr=False)
+    population_id: Union[int, None] = dataclasses.field(default=None, repr=False)
 
-    def __attrs_post_init__(self):
+    _type_str: ClassVar[str] = "Population parameter change"
+
+    def __post_init__(self):
 
         if self.population_id is not None and self.population is not None:
             raise ValueError(
@@ -621,23 +961,38 @@ class PopulationParametersChange(DemographicEvent):
             ret["initial_size"] = self.initial_size
         return ret
 
-    def __str__(self):
-        s = f"Population parameter change for {self.population}: "
+    def _parameters(self):
+        s = f"population={self.population}, "
         if self.initial_size is not None:
-            s += f"initial_size -> {self.initial_size} "
+            s += f"initial_size={self.initial_size}, "
         if self.growth_rate is not None:
-            s += f"growth_rate -> {self.growth_rate} "
-        return s[:-1]
+            s += f"growth_rate={self.growth_rate}, "
+        return s[:-2]
+
+    def _effect(self):
+        s = ""
+        if self.initial_size is not None:
+            s += f"initial_size → {self.initial_size} "
+            if self.growth_rate is not None:
+                s += "and "
+        if self.growth_rate is not None:
+            s += f"growth_rate → {self.growth_rate} "
+        s += "for"
+        if self.population == -1:
+            s += " all populations"
+        else:
+            s += f" population {self.population}"
+        return s
 
 
-@attr.s
+@dataclasses.dataclass
 class MigrationRateChange(DemographicEvent):
     """
     Changes the rate of migration from one deme to another to a new value at a
     specific time. Migration rates are specified in terms of the rate at which
     lineages move from population ``source`` to ``dest`` during the progress of
     the simulation. Note that ``source`` and ``dest`` are from the perspective
-    of the coalescent process; please see the :ref:`sec_api_simulation_model`
+    of the coalescent process; please see the :ref:`sec_ancestry_models`
     section for more details on the interpretation of this migration model.
 
     By default, ``source=-1`` and ``dest=-1``, which results in all
@@ -652,14 +1007,16 @@ class MigrationRateChange(DemographicEvent):
     :param int source: The source population ID.
     """
 
-    rate = attr.ib()
-    source = attr.ib(default=-1)
-    dest = attr.ib(default=-1)
+    rate: float
+    source: int = -1
+    dest: int = -1
     # Deprecated.
     # TODO add a formal deprecation notice
-    matrix_index = attr.ib(default=None, repr=False)
+    matrix_index: Union[tuple, None] = dataclasses.field(default=None, repr=False)
 
-    def __attrs_post_init__(self):
+    _type_str: ClassVar[str] = "Migration rate change"
+
+    def __post_init__(self):
         # If the deprecated form is used, it overwrites the values of source
         # and dest
         if self.matrix_index is not None:
@@ -677,16 +1034,20 @@ class MigrationRateChange(DemographicEvent):
             "dest": self.dest,
         }
 
-    def __str__(self):
+    def _parameters(self):
+        return f"source={self.source}, dest={self.dest}, rate={self.rate}"
+
+    def _effect(self):
+        ret = "Backwards-time migration rate "
         if self.source == -1 and self.dest == -1:
-            ret = f"Migration rate change to {self.rate} everywhere"
+            ret += "for all populations "
         else:
-            matrix_index = (self.source, self.dest)
-            ret = f"Migration rate change for {matrix_index} to {self.rate}"
+            ret += f"from {self.source} to {self.dest} "
+        ret += f"→ {self.rate}"
         return ret
 
 
-@attr.s
+@dataclasses.dataclass
 class MassMigration(DemographicEvent):
     """
     A mass migration event in which some fraction of the population in one deme
@@ -694,7 +1055,7 @@ class MassMigration(DemographicEvent):
     progress of the simulation. Each lineage currently present in the source
     population moves to the destination population with probability equal to
     ``proportion``. Note that ``source`` and ``dest`` are from the perspective
-    of the coalescent process; please see the :ref:`sec_api_simulation_model`
+    of the coalescent process; please see the :ref:`sec_ancestry_models`
     section for more details on the interpretation of this migration model.
 
     This event class generalises the population split (``-ej``) and
@@ -708,15 +1069,17 @@ class MassMigration(DemographicEvent):
         the source population migrates to the destination population.
     """
 
-    source = attr.ib()
+    source: int
     # dest only has a default because of the deprecated destination attr.
-    dest = attr.ib(default=None)
-    proportion = attr.ib(default=1.0)
+    dest: Union[None, int] = None
+    proportion: float = 1.0
     # Deprecated.
     # TODO add a formal deprecation notice
-    destination = attr.ib(default=None, repr=False)
+    destination: Union[int, None] = dataclasses.field(default=None, repr=False)
 
-    def __attrs_post_init__(self):
+    _type_str: ClassVar[str] = dataclasses.field(default="Mass Migration", repr=False)
+
+    def __post_init__(self):
         if self.dest is not None and self.destination is not None:
             raise ValueError("dest and destination are aliases; cannot supply both")
         if self.destination is not None:
@@ -733,23 +1096,22 @@ class MassMigration(DemographicEvent):
             "proportion": self.proportion,
         }
 
-    def __str__(self):
+    def _parameters(self):
+        return f"source={self.source}, dest={self.dest}, proportion={self.proportion}"
+
+    def _effect(self):
         return (
-            "Mass migration: "
-            "Lineages moved with probability {} backwards in time with "
-            "source {} & dest {}"
-            "\n                     "
-            "(equivalent to migration from {} to {} forwards in time)".format(
-                self.proportion, self.source, self.dest, self.dest, self.source
-            )
+            f"Lineages currently in population {self.source} move to {self.dest} "
+            f"with probability {self.proportion} (equivalent to individuals "
+            f"migrating from {self.dest} to {self.source} forwards in time)"
         )
 
 
 # This is an unsupported/undocumented demographic event.
-@attr.s
+@dataclasses.dataclass
 class SimpleBottleneck(DemographicEvent):
-    population = attr.ib()
-    proportion = attr.ib(default=1.0)
+    population: int
+    proportion: float = 1.0
 
     def get_ll_representation(self, num_populations=None):
         # We need to keep the num_populations argument until stdpopsim 0.1 is out
@@ -761,18 +1123,25 @@ class SimpleBottleneck(DemographicEvent):
             "proportion": self.proportion,
         }
 
-    def __str__(self):
+    _type_str: ClassVar[str] = dataclasses.field(
+        default="Simple Bottleneck", repr=False
+    )
+
+    def _parameters(self):
+        return f"population={self.population}, proportion={self.proportion}"
+
+    def _effect(self):
         return (
-            "Simple bottleneck: lineages in population {} coalesce "
-            "probability {}".format(self.population, self.proportion)
+            f"Lineages in population {self.population} coalesce with "
+            f"probability {self.proportion}"
         )
 
 
 # TODO document
-@attr.s
+@dataclasses.dataclass
 class InstantaneousBottleneck(DemographicEvent):
-    population = attr.ib(default=None)
-    strength = attr.ib(default=1.0)
+    population: int
+    strength: float = 1.0
 
     def get_ll_representation(self, num_populations=None):
         # We need to keep the num_populations argument until stdpopsim 0.1 is out
@@ -784,14 +1153,18 @@ class InstantaneousBottleneck(DemographicEvent):
             "strength": self.strength,
         }
 
-    def __str__(self):
-        return (
-            "Instantaneous bottleneck in population {}: equivalent to {} "
-            "generations of the coalescent".format(self.population, self.strength)
-        )
+    _type_str: ClassVar[str] = dataclasses.field(
+        default="Instantaneous Bottleneck", repr=False
+    )
+
+    def _parameters(self):
+        return f"population={self.population}, strength={self.strength}"
+
+    def _effect(self):
+        return f"Equivalent to {self.strength} generations of the coalescent"
 
 
-@attr.s
+@dataclasses.dataclass
 class CensusEvent(DemographicEvent):
     """
     An event that adds a node to each branch of every tree at a given time
@@ -800,10 +1173,13 @@ class CensusEvent(DemographicEvent):
     haplotypes: for instance to trace the local ancestry of a sample back to a
     set of contemporaneous ancestors, or to assess whether a subset of samples
     has coalesced more recently than the census time.
-    See the :ref:`tutorial<sec_tutorial_demography_census>` for an example.
+
+    See :ref:`sec_ancestry_census_events` for more details.
 
     :param float time: The time at which this event occurs in generations.
     """
+
+    _type_str: ClassVar[str] = dataclasses.field(default="Census", repr=False)
 
     def get_ll_representation(self, num_populations=None):
         # We need to keep the num_populations argument until stdpopsim 0.1 is out
@@ -813,34 +1189,37 @@ class CensusEvent(DemographicEvent):
             "time": self.time,
         }
 
-    def __str__(self):
-        return "Census event"
+    def _parameters(self):
+        return ""
+
+    def _effect(self):
+        return "Insert census nodes to record the location of all lineages"
 
 
-@attr.s
-class PopulationParameters:
+@dataclasses.dataclass
+class PopulationState:
     """
     Simple class to represent the state of a population in terms of its
     demographic parameters.
     """
 
-    start_size = attr.ib(default=None)
-    end_size = attr.ib(default=None)
-    growth_rate = attr.ib(default=None)
+    start_size: float
+    end_size: float
+    growth_rate: float
 
 
-@attr.s
+@dataclasses.dataclass
 class Epoch:
     """
     Represents a single epoch in the simulation within which the state
     of the demographic parameters are constant.
     """
 
-    start_time = attr.ib(default=None)
-    end_time = attr.ib(default=None)
-    populations = attr.ib(default=None)
-    migration_matrix = attr.ib(default=None)
-    demographic_events = attr.ib(default=None)
+    start_time: float
+    end_time: float
+    populations: List[PopulationState]
+    migration_matrix: list  # TODO numpy array
+    demographic_events: List[DemographicEvent]
 
 
 def _matrix_exponential(A):
@@ -865,19 +1244,22 @@ class DemographyDebugger:
 
     def __init__(
         self,
-        demography=None,
         # Deprecated pre-1.0 parameters.
         Ne=1,
         population_configurations=None,
         migration_matrix=None,
         demographic_events=None,
         model=None,
+        *,
+        demography=None,
     ):
-        self.precision = 3
         if demography is None:
             # Support the pre-1.0 syntax
             demography = Demography.from_old_style(
-                population_configurations, migration_matrix, demographic_events
+                population_configurations,
+                migration_matrix,
+                demographic_events,
+                Ne=Ne,
             )
         self.demography = demography
         self.num_populations = demography.num_populations
@@ -886,17 +1268,18 @@ class DemographyDebugger:
 
     def _make_epochs(self):
         self.epochs = []
-        # Create some samples to keep the simulator factory happy
-        # FIXME samples shouldn't be needed here any more.
+        # We don't actually use the samples, this is just to get the simulator
+        # correctly initialised.
+        samples = {}
         for j, pop in enumerate(self.demography.populations):
-            if pop.initial_size is None or pop.initial_size > 0:
-                samples = 2 * [Sample(population=j, time=0)]
-                break
-        else:
+            if pop.initial_size > 0 and pop.sampling_time == 0:
+                samples[j] = 1
+        if len(samples) == 0:
             raise ValueError("No population with non-zero initial size.")
-        simulator = ancestry._parse_simulate(
-            samples=samples, demography=self.demography
+        simulator = ancestry._parse_sim_ancestry(
+            demography=self.demography, samples=samples
         )
+
         start_time = 0
         end_time = 0
         abs_tol = 1e-9
@@ -915,7 +1298,7 @@ class DemographyDebugger:
                 conf["growth_rate"] for conf in simulator.population_configuration
             ]
             populations = [
-                PopulationParameters(
+                PopulationState(
                     start_size=simulator.compute_population_size(j, start_time),
                     end_size=simulator.compute_population_size(j, end_time),
                     growth_rate=growth_rates[j],
@@ -945,94 +1328,95 @@ class DemographyDebugger:
                         "demographic misspecification."
                     )
 
-    def _print_populations(self, epoch, output):
-        field_width = self.precision + 6
-        growth_rate_field_width = 14
-        sep_str = " | "
-        N = len(epoch.migration_matrix)
-        fmt = (
-            "{id:<2} "
-            "{start_size:^{field_width}}"
-            "{end_size:^{field_width}}"
-            "{growth_rate:>{growth_rate_field_width}}"
-        )
-        print(
-            fmt.format(
-                id="",
-                start_size="start",
-                end_size="end",
-                growth_rate="growth_rate",
-                field_width=field_width,
-                growth_rate_field_width=growth_rate_field_width,
-            ),
-            end=sep_str,
-            file=output,
-        )
-        for k in range(N):
-            print("{0:^{1}}".format(k, field_width), end="", file=output)
-        print(file=output)
-        h = "-" * (field_width - 1)
-        print(
-            fmt.format(
-                id="",
-                start_size=h,
-                end_size=h,
-                growth_rate=h,
-                field_width=field_width,
-                growth_rate_field_width=growth_rate_field_width,
-            ),
-            end=sep_str,
-            file=output,
-        )
-        for _ in range(N):
-            s = "-" * (field_width - 1)
-            print("{0:<{1}}".format(s, field_width), end="", file=output)
-        print(file=output)
+    def _populations_html(self, epoch):
+        column_titles = ["", "start", "end", "growth_rate"] + [
+            pop.name for pop in self.demography.populations
+        ]
+        data = []
         for j, pop in enumerate(epoch.populations):
-            s = (
-                "{id:<2}|"
-                "{start_size:^{field_width}.{precision}g}"
-                "{end_size:^{field_width}.{precision}g}"
-                "{growth_rate:>{growth_rate_field_width}.{precision}g}"
-            ).format(
-                id=j,
-                start_size=pop.start_size,
-                end_size=pop.end_size,
-                growth_rate=pop.growth_rate,
-                precision=self.precision,
-                field_width=field_width,
-                growth_rate_field_width=growth_rate_field_width,
-            )
-            print(s, end=sep_str, file=output)
-            for k in range(N):
-                x = epoch.migration_matrix[j][k]
-                print(
-                    "{0:^{1}.{2}g}".format(x, field_width, self.precision),
-                    end="",
-                    file=output,
+            row = [
+                self.demography.populations[j].name,
+                f"{pop.start_size: .3g}",
+                f"{pop.end_size: .3g}",
+                f"{pop.growth_rate: .3g}",
+            ]
+            for k in range(self.demography.num_populations):
+                item = self.demography._migration_rate_info(
+                    j, k, epoch.migration_matrix[j, k]
                 )
-            print(file=output)
+                row.append(item)
+            data.append(row)
+        return core.html_table("", column_titles, data)
+
+    def _populations_text(self, epoch):
+        column_titles = [[""], ["start"], ["end"], ["growth_rate"]] + [
+            [pop.name] for pop in self.demography.populations
+        ]
+        alignments = ">>><" + "^" * self.demography.num_populations
+        data = []
+        for j, pop in enumerate(epoch.populations):
+            row = [
+                [self.demography.populations[j].name],
+                [f"{pop.start_size: .3g}"],
+                [f"{pop.end_size: .3g}"],
+                [f"{pop.growth_rate: .3g}"],
+            ]
+            for k in range(self.demography.num_populations):
+                row.append([f"{epoch.migration_matrix[j, k]:.3g}"])
+            data.append(row)
+        return core.text_table("Population state", column_titles, alignments, data)
+
+    def _repr_html_(self):
+        out = ""
+        for j, epoch in enumerate(self.epochs):
+            if j > 0:
+                if len(epoch.demographic_events) > 0:
+                    title = f"Events @ generation {epoch.start_time}"
+                    out += self.demography._events_html(epoch.demographic_events, title)
+                out += "</p>"
+            else:
+                assert len(epoch.demographic_events) == 0
+            epoch_title = f"Epoch: {epoch.start_time} -- {epoch.end_time} generations"
+            out += "<p>"
+            out += f"<h3>{epoch_title}</h3>"
+            out += self._populations_html(epoch)
+        out += "</p>"
+        return f"<div>{out}</div>"
 
     def print_history(self, output=sys.stdout):
         """
         Prints a summary of the history of the populations.
+
+        Deprecated since 1.0: use ``print(debugger)`` instead.
         """
-        for epoch in self.epochs:
-            if len(epoch.demographic_events) > 0:
-                print(f"Events @ generation {epoch.start_time}", file=output)
-            for event in epoch.demographic_events:
-                print("   -", event, file=output)
-            s = f"Epoch: {epoch.start_time} -- {epoch.end_time} generations"
-            print("=" * len(s), file=output)
-            print(s, file=output)
-            print("=" * len(s), file=output)
-            self._print_populations(epoch, output)
-            print(file=output)
+        print(self, file=output, end="")
 
     def __str__(self):
-        buff = io.StringIO()
-        self.print_history(buff)
-        return buff.getvalue()
+        def indent(table, header_char="╟", depth=4):
+            lines = table.splitlines()
+            s = header_char + (" " * depth) + lines[0] + "\n"
+            for line in lines[1:]:
+                s += "║" + (" " * depth) + line + "\n"
+            return s
+
+        def box(title):
+            N = len(title) + 2
+            top = "╠" + ("═" * N) + "╗"
+            bottom = "╠" + ("═" * N) + "╝"
+            return f"{top}\n║ {title} ║\n{bottom}\n"
+
+        out = "DemographyDebugger\n"
+        for j, epoch in enumerate(self.epochs):
+            if j > 0:
+                if len(epoch.demographic_events) > 0:
+                    title = f"Events @ generation {epoch.start_time}"
+                    out += indent(
+                        self.demography._events_text(epoch.demographic_events, title)
+                    )
+            epoch_title = f"Epoch: {epoch.start_time} -- {epoch.end_time} generations"
+            out += box(epoch_title)
+            out += indent(self._populations_text(epoch))
+        return out
 
     def population_size_trajectory(self, steps):
         """
