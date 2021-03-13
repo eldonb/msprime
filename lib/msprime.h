@@ -84,10 +84,18 @@ typedef struct {
     tsk_size_t value;
 } node_mapping_t;
 
+#define MSP_POP_STATE_INACTIVE 0
+#define MSP_POP_STATE_ACTIVE 1
+#define MSP_POP_STATE_PREVIOUSLY_ACTIVE 2
+
 typedef struct {
+    /* The starting size and time for the current epoch for this population. */
     double initial_size;
-    double growth_rate;
     double start_time;
+    double growth_rate;
+    /* The lifecycle state machine. States go strictly from
+     * inactive -> active -> previously_active */
+    int state;
     avl_tree_t *ancestors;
     tsk_size_t num_potential_destinations;
     tsk_id_t *potential_destinations;
@@ -148,7 +156,7 @@ typedef struct {
     /* TODO document these parameters.*/
     double start_frequency;
     double end_frequency;
-    double alpha;
+    double s;
     double dt;
 } genic_selection_trajectory_t;
 
@@ -274,6 +282,24 @@ typedef struct {
     double proportion;
 } mass_migration_t;
 
+/* Arbitrary limit, saves us having to put in complex malloc/free
+ * logic in the demographic_events. Can easily be changed if
+ * needs be. */
+#define MSP_MAX_EVENT_POPULATIONS 100
+
+typedef struct {
+    population_id_t derived[MSP_MAX_EVENT_POPULATIONS];
+    population_id_t ancestral;
+    size_t num_derived;
+} population_split_t;
+
+typedef struct {
+    population_id_t derived;
+    population_id_t ancestral[MSP_MAX_EVENT_POPULATIONS];
+    double proportion[MSP_MAX_EVENT_POPULATIONS];
+    size_t num_ancestral;
+} admixture_t;
+
 typedef struct {
     population_id_t population;
     double proportion;
@@ -292,6 +318,8 @@ typedef struct demographic_event_t_t {
         simple_bottleneck_t simple_bottleneck;
         instantaneous_bottleneck_t instantaneous_bottleneck;
         mass_migration_t mass_migration;
+        population_split_t population_split;
+        admixture_t admixture;
         migration_rate_change_t migration_rate_change;
         population_parameters_change_t population_parameters_change;
     } params;
@@ -385,7 +413,7 @@ int msp_set_simulation_model_wf_ped(msp_t *self);
 int msp_set_simulation_model_dirac(msp_t *self, double psi, double c);
 int msp_set_simulation_model_beta(msp_t *self, double alpha, double truncation_point);
 int msp_set_simulation_model_sweep_genic_selection(msp_t *self, double position,
-    double start_frequency, double end_frequency, double alpha, double dt);
+    double start_frequency, double end_frequency, double s, double dt);
 
 int msp_set_start_time(msp_t *self, double start_time);
 int msp_set_store_migrations(msp_t *self, bool store_migrations);
@@ -403,8 +431,8 @@ int msp_set_node_mapping_block_size(msp_t *self, size_t block_size);
 int msp_set_segment_block_size(msp_t *self, size_t block_size);
 int msp_set_avl_node_block_size(msp_t *self, size_t block_size);
 int msp_set_migration_matrix(msp_t *self, size_t size, double *migration_matrix);
-int msp_set_population_configuration(
-    msp_t *self, int population_id, double initial_size, double growth_rate);
+int msp_set_population_configuration(msp_t *self, int population_id, double initial_size,
+    double growth_rate, bool initially_active);
 
 int msp_add_population_parameters_change(
     msp_t *self, double time, int population_id, double size, double growth_rate);
@@ -412,6 +440,10 @@ int msp_add_migration_rate_change(
     msp_t *self, double time, int source_pop, int dest_pop, double migration_rate);
 int msp_add_mass_migration(
     msp_t *self, double time, int source, int dest, double proportion);
+int msp_add_population_split(
+    msp_t *self, double time, size_t num_derived, int32_t *derived, int ancestral);
+int msp_add_admixture(msp_t *self, double time, int derived, size_t num_ancestral,
+    int32_t *ancestral, double *proportions);
 int msp_add_simple_bottleneck(
     msp_t *self, double time, int population_id, double intensity);
 int msp_add_instantaneous_bottleneck(
@@ -431,8 +463,8 @@ int msp_get_ancestors(msp_t *self, segment_t **ancestors);
 int msp_get_breakpoints(msp_t *self, size_t *breakpoints);
 int msp_get_migration_matrix(msp_t *self, double *migration_matrix);
 int msp_get_num_migration_events(msp_t *self, size_t *num_migration_events);
-int msp_get_population_configuration(
-    msp_t *self, size_t population_id, double *initial_size, double *growth_rate);
+int msp_get_population_configuration(msp_t *self, size_t population_id,
+    double *initial_size, double *growth_rate, int *state);
 int msp_compute_population_size(
     msp_t *self, size_t population_id, double time, double *pop_size);
 int msp_is_completed(msp_t *self);

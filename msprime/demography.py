@@ -22,14 +22,19 @@ Module responsible for defining and debugging demographic models.
 from __future__ import annotations
 
 import collections
+import copy
 import dataclasses
+import enum
 import inspect
+import itertools
 import logging
 import math
 import sys
 import textwrap
 import warnings
+from typing import Any
 from typing import ClassVar
+from typing import Dict
 from typing import List
 from typing import Union
 
@@ -60,81 +65,460 @@ def check_migration_rate(migration_rate):
         raise ValueError("Migration rates must be non-negative")
 
 
-def check_population_size(Ne):
+@dataclasses.dataclass
+class Population:
     """
-    Check if an input population size makes sense.
+    Define a :ref:`population <sec_demography_populations>` in a
+    :class:`.Demography`.
+
+    :ivar initial_size: The absolute size of the population at time zero.
+    :vartype initial_size: float
+    :var growth_rate: The exponential growth rate of the
+        population per generation (forwards in time).
+        Growth rates can be negative. This is zero for a
+        constant population size, and positive for a population that has been
+        growing. Defaults to 0.
+    :vartype growth_rate: float
+    :ivar name: The name of the population. If specified this must be a uniquely
+        identifying string and must be a valid Python identifier (i.e., could be
+        used as a variable name in Python code).
+    :vartype name: str
+    :ivar description: A short description of the population. Defaults to the
+        empty string if not specified.
+    :vartype description: str
+    :ivar extra_metadata: A JSON-encodable dictionary of metadata items to be
+        stored in the associated tskit population object. This dictionary
+        must not contain keys for any of the pre-defined metadata items.
+    :vartype extra_metadata: dict
+    :ivar default_sampling_time: The default time at which samples are drawn from
+        this population. See the
+        :ref:`sec_demography_populations_default_sampling_time`
+        section for more details.
+    :vartype default_sampling_time: float
+    :ivar id: The integer ID of this population within the parent
+        :class:`.Demography`. This attribute is assigned by the Demography
+        class and should not be set or changed by user code.
+    :vartype id: int
     """
-    if Ne is not None and Ne <= 0:
-        raise ValueError("Population size must be positive")
+
+    initial_size: float = 0.0
+    growth_rate: float = 0.0
+    name: Union[str, None] = None
+    description: str = ""
+    extra_metadata: dict = dataclasses.field(default_factory=dict)
+    default_sampling_time: Union[float, None] = None
+    initially_active: Union[bool, None] = None
+
+    # Keeping this as something we can init because this stops us
+    # doing things like round-tripping through repr. The warning
+    # above should suffice.
+    id: Union[int, None] = dataclasses.field(default=None)  # noqa: A003
+
+    def asdict(self):
+        return dataclasses.asdict(self)
+
+    def validate(self):
+        # TODO more checks
+        if self.initial_size < 0:
+            raise ValueError("Negative population size")
+        if self.name is None:
+            raise ValueError("A population name must be set.")
+        if not self.name.isidentifier():
+            raise ValueError("A population name must be a valid Python identifier")
 
 
 @dataclasses.dataclass
 class Demography:
     """
-    A description of a demographic model for an msprime simulation.
-
-    TODO document properly.
-
-    Population structure is modelled by specifying a fixed number of
-    subpopulations :math:`d`, and a :math:`d \\times d` matrix :math:`M` of
-    per-generation migration rates. The :math:`(j,k)^{th}` entry of :math:`M`
-    is the expected number of migrants moving from population :math:`k` to
-    population :math:`j` per generation, divided by the size of population
-    :math:`j`. In terms of the coalescent process, :math:`M_{j,k}` gives the
-    rate at which an ancestral lineage moves from population :math:`j` to
-    population :math:`k`, as one follows it back through time. In
-    continuous-time models, when :math:`M_{j,k}` is close to zero, this rate is
-    approximately equivalent to the fraction of population :math:`j` that is
-    replaced each generation by migrants from population :math:`k`. In
-    discrete-time models, the equivalence is exact and each row of :math:`M`
-    has the constraint :math:`\\sum_{k \\neq j} M_{j,k} \\leq 1`. This differs
-    from the migration matrix one usually uses in population demography: if
-    :math:`m_{k,j}` is the proportion of individuals (in the usual sense; not
-    lineages) in population :math:`k` that move to population :math:`j` per
-    generation, then translating this proportion of population :math:`k` to a
-    proportion of population :math:`j`, we have :math:`M_{j,k} = m_{k,j}
-    \\times N_k / N_j`.
-
-    Each subpopulation has an initial absolute population size :math:`s`
-    and a per generation exponential growth rate :math:`\\alpha`. The size of a
-    given population at time :math:`t` in the past (measured in generations) is
-    therefore given by :math:`s e^{-\\alpha t}`. Demographic events that occur in
-    the history of the simulated population alter some aspect of this population
-    configuration at a particular time in the past.
-
+    The definition of a demographic model for an msprime simulation,
+    consisting of a set of populations, a migration matrix, and a list
+    of demographic events. See the :ref:`sec_demography_definitions`
+    section for precise mathematical definitions of these concepts.
     """
 
     populations: List[Population] = dataclasses.field(default_factory=list)
     events: List = dataclasses.field(default_factory=list)
-    migration_matrix: Union[np.ndarray, None] = None
+    # Until we can use numpy type hints properly, it's not worth adding them
+    # here. We still have to add in ignores below for indexed assignment errors.
+    migration_matrix: Union[Any, None] = None
 
     def __post_init__(self):
         if self.migration_matrix is None:
             N = self.num_populations
             self.migration_matrix = np.zeros((N, N))
 
-        # Sort demographic events by time.
-        self.events.sort(key=lambda de: de.time)
-        self.__name_id_map = None
+        # People might get cryptic errors from passing in copies of the same
+        # population, so check for it.
+        if len({id(pop) for pop in self.populations}) != len(self.populations):
+            raise ValueError("Population objects must be distinct")
+
+        # Assign the IDs and default names, if needed.
+        for j, population in enumerate(self.populations):
+            if population.id is not None:
+                raise ValueError(
+                    "Population ID should not be set before using to create "
+                    "a Demography"
+                )
+            population.id = j
+            if population.name is None:
+                population.name = f"pop_{j}"
+        self._validate_populations()
+
+    def add_population(
+        self,
+        *,
+        initial_size=None,
+        growth_rate=None,
+        name=None,
+        description=None,
+        extra_metadata=None,
+        default_sampling_time=None,
+        initially_active=None,
+    ) -> Population:
+        """
+        TODO document
+        """
+        N = self.num_populations
+        population = Population()
+        population.id = N
+        population.growth_rate = 0 if growth_rate is None else growth_rate
+        population.initial_size = 1 if initial_size is None else initial_size
+        population.name = f"pop_{population.id}" if name is None else name
+        population.description = "" if description is None else description
+        population.extra_metadata = {} if extra_metadata is None else extra_metadata
+        population.default_sampling_time = default_sampling_time
+        population.initially_active = initially_active
+        self.populations.append(population)
+        M = self.migration_matrix
+        self.migration_matrix = np.zeros((N + 1, N + 1))
+        self.migration_matrix[:N, :N] = M
+        self._validate_populations()
+        return population
+
+    def _add_population_from_old_style(
+        self, pop_config: PopulationConfiguration, name: Union[str, None] = None
+    ) -> Population:
+        population = self.add_population(
+            name=name,
+            initial_size=pop_config.initial_size,
+            growth_rate=pop_config.growth_rate,
+        )
+        metadata = pop_config.metadata
+        if metadata is not None and isinstance(metadata, collections.abc.Mapping):
+            metadata = metadata.copy()
+            if "name" in metadata:
+                population.name = metadata.pop("name")
+                if name is not None and name != population.name:
+                    # Maybe this should be a warning, or just ignored entirely?
+                    raise ValueError(
+                        "Population name already set in old-style metadata "
+                        f"({name}) and doesn't match supplied name "
+                        f"({population.name})"
+                    )
+            if "description" in metadata:
+                population.description = metadata.pop("description")
+        population.extra_metadata = metadata
+        return population
+
+    def add_event(self, event: DemographicEvent) -> DemographicEvent:
+        if not isinstance(event, DemographicEvent):
+            raise TypeError("Events must be instances of DemographicEvent")
+        event.demography = self
+        self.events.append(event)
+        return event
+
+    def set_migration_rate(
+        self, source: Union[str, int], dest: Union[str, int], rate: float
+    ):
+        """
+        Sets the backwards-time rate of migration from the specified ``source``
+        population to ``dest`` to the specified value. This has the effect of
+        setting ``demography.migration_matrix[source, dest] = rate``.
+
+        .. warning:: Note this is the **backwards time** migration rate and that
+            ``source`` and ``dest`` are from the perspective of lineages in the
+            coalescent process. See :ref:`sec_demography_migration` for more
+            details and clarification on this vital point.
+
+        The ``source`` and ``dest`` populations can be referred to either by
+        their integer ``id`` or string ``name`` values.
+
+        :param str,int source: The source population from which lineages originate
+            in the backwards-time process.
+        :param str,int dest: The destination population where lineages are move
+            to in the backwards-time process.
+        :param float rate: The per-generation migration rate.
+        """
+        source = self[source].id
+        dest = self[dest].id
+        if source == dest:
+            raise ValueError("The source and dest populations must be different")
+        self.migration_matrix[source, dest] = rate  # type: ignore
+
+    def set_symmetric_migration_rate(
+        self,
+        populations: List[Union[str, int]],
+        rate: float,
+    ):
+        """
+        Sets the symmetric migration rate between all pairs of populations in
+        the specified list to the specified value. For a given pair of population
+        IDs ``j`` and ``k``, this sets ``demography.migration_matrix[j, k] = rate``
+        and ``demography.migration_matrix[k, j] = rate``.
+
+        Populations may be specified either by their integer IDs or by
+        their string names.
+
+        :param list populations: An iterable of population identifiers (integer
+            IDs or string names).
+        :param float rate: The value to set the migration matrix entries to.
+        """
+        # There's an argument for not checking this so that corner cases on
+        # single population models can be handled. However, it's nearly always
+        # going to be a user error where someone forgets the second population
+        # so it seems better to raise an error to prevent hard-to-detect mistakes.
+        if len(populations) < 2:
+            raise ValueError("Must specify at least two populations")
+        pop_ids = [self[identifier].id for identifier in populations]
+        for pop_j, pop_k in itertools.combinations(pop_ids, 2):
+            self.migration_matrix[pop_j, pop_k] = rate  # type: ignore
+            self.migration_matrix[pop_k, pop_j] = rate  # type: ignore
+
+    # Demographic events.
+
+    def add_population_split(
+        self, time: float, *, derived: List[Union[str, int]], ancestral: Union[str, int]
+    ) -> PopulationSplit:
+        """
+        Adds a population split event at the specified time. In a population
+        split event all lineages from the (more recent) derived populations
+        move to the (more ancient) ancestral population. Forwards in time,
+        this corresponds to the ancestral population splitting into the
+        derived populations.
+
+        .. todo:: Add some links here, to the documentation and to the
+            other types of events we might want to support.
+
+        In addition to moving lineages from the derived population(s) into the
+        ancestral population, a population split has the following additional
+        effects:
+
+        - All migration rates to and from the derived populations are set to 0.
+        - Population sizes and growth rates for the derived populations are set
+          to 0.
+        - The ``default_sampling_time`` of the ``ancestral`` :class:`.Population`
+          is set to the time of this event, **if** the ``default_sampling_time``
+          for the ancestral population has not already been set.
+
+        :param float time: The time at which this event occurs in generations.
+        :param list(str, int) derived: The derived populations.
+        :param str, int ancestral: The ancestral population.
+        """
+        pop = self[ancestral]
+        if pop.initially_active is None:
+            pop.initially_active = False
+            if pop.default_sampling_time is None:
+                pop.default_sampling_time = time
+        return self.add_event(
+            PopulationSplit(time=time, derived=derived, ancestral=ancestral)
+        )
+
+    def add_admixture(
+        self,
+        time: float,
+        *,
+        derived: Union[str, int],
+        ancestral: List[Union[str, int]],
+        proportions: List[float],
+    ) -> Admixture:
+        """
+        Adds an admixture event at the specified time. In an admixture
+        event all lineages from a (more recent) ``derived`` population
+        move to a list of (more ancient) ``ancestral`` populations according
+        to a list of ``proportions``, such that a given lineage has a
+        probability ``proportions[j]`` of being moved to the population
+        ``ancestral[j]``. This movement of lineages backwards in time
+        corresponds to the initial state of the admixed derived population
+        the specified ``time`` being composed of individuals from the
+        specified ``ancestral`` populations in the specified ``proportions``.
+
+        .. todo:: Add some links here, to the documentation and to the
+            other types of events we might want to support.
+
+        In addition to moving lineages from the derived population into the
+        ancestral population(s), an admixture has the following additional
+        effects:
+
+        - All migration rates to and from the derived population are set to 0.
+        - Population sizes and growth rates for the derived population are set
+          to 0, and the poulation is marked as inactive.
+
+        :param float time: The time at which this event occurs in generations.
+        :param str, int derived: The derived population.
+        :param list(str, int) ancestral: The ancestral populations.
+        :param list(float) proportions: The proportion of the derived population
+            from each of the ancestral populations at the time of the event.
+        """
+        # Useful feature here might be to support taking n - 1 proportion values
+        # and computing 1 - sum for the last value. Could be tedious for users to
+        # do this manually.
+        if not math.isclose(sum(proportions), 1.0):
+            raise ValueError("Sum of the admixture proportions must be approximately 1")
+        return self.add_event(
+            Admixture(
+                time=time, derived=derived, ancestral=ancestral, proportions=proportions
+            )
+        )
+
+    def add_mass_migration(self, time, *, source, dest, proportion):
+        # TODO document. Not clear whether we document this with a warning
+        # or we just leave it as population split, etc.
+        return self.add_event(MassMigration(time, source, dest, proportion))
+
+    def add_migration_rate_change(
+        self,
+        time: float,
+        *,
+        rate: float,
+        source: Union[int, str, None] = None,
+        dest: Union[int, str, None] = None,
+    ) -> MigrationRateChange:
+        """
+        Changes the rate of migration from one deme to another to a new value at a
+        specific time. Migration rates are specified in terms of the rate at which
+        lineages move from population ``source`` to ``dest`` during the progress of
+        the simulation.
+
+        .. warning::
+            Note that ``source`` and ``dest`` are from the perspective of the
+            coalescent process, i.e. **backwards in time**; please see the
+            :ref:`sec_demography_migration` section for more details on the
+            interpretation of this migration model.
+
+        By default, ``source=None`` and ``dest=None``, which results in all
+        non-diagonal elements of the migration matrix being changed to the new
+        rate. If ``source`` and ``dest`` are specified, they must refer to valid
+        populations (either integer IDs or string names).
+
+        :param float time: The time at which this event occurs in generations.
+        :param float rate: The new per-generation migration rate.
+        :param str, int source: The ID of the source population.
+        :param str, int dest: The ID of the destination population.
+        :param int source: The source population ID.
+        """
+        source = -1 if source is None else source
+        dest = -1 if dest is None else dest
+        return self.add_event(
+            MigrationRateChange(time=time, source=source, dest=dest, rate=rate)
+        )
+
+    def add_symmetric_migration_rate_change(
+        self, time: float, populations: List[Union[str, int]], rate: float
+    ) -> SymmetricMigrationRateChange:
+        """
+        Sets the symmetric migration rate between all pairs of populations in
+        the specified list to the specified value. For a given pair of population
+        IDs ``j`` and ``k``, this sets ``migration_matrix[j, k] = rate``
+        and ``migration_matrix[k, j] = rate``.
+
+        Populations may be specified either by their integer IDs or by
+        their string names.
+
+        :param float time: The time at which this event occurs in generations.
+        :param list populations: An sequence of population identifiers (integer
+            IDs or string names).
+        :param float rate: The new migration rate.
+        """
+        return self.add_event(
+            SymmetricMigrationRateChange(time=time, populations=populations, rate=rate)
+        )
+
+    def add_population_parameters_change(
+        self,
+        time: float,
+        *,
+        initial_size: Union[float, None] = None,
+        growth_rate: Union[float, None] = None,
+        population: Union[int, None] = None,
+    ) -> PopulationParametersChange:
+        """
+        Changes the size parameters of a population (or all populations)
+        at a given time.
+
+        :param float time: The length of time ago at which this event
+            occurred.
+        :param float initial_size: The absolute size of the population
+            at the beginning of the time slice starting at ``time``. If None,
+            the initial_size of the population is computed according to
+            the initial population size and growth rate over the preceding
+            time slice.
+        :param float growth_rate: The new per-generation growth rate. If None,
+            the growth rate is not changed. Defaults to None.
+        :param str, int population: The ID of the population affected. If
+            ``population`` is None, the changes affect all populations
+            simultaneously.
+        """
+        event = PopulationParametersChange(
+            time,
+            initial_size=initial_size,
+            growth_rate=growth_rate,
+            population=population,
+        )
+        return self.add_event(event)
+
+    def add_simple_bottleneck(
+        self,
+        time: float,
+        population: Union[int, str],
+        proportion: Union[float, None] = None,
+    ) -> SimpleBottleneck:
+        proportion = 1.0 if proportion is None else proportion
+        return self.add_event(
+            SimpleBottleneck(time=time, population=population, proportion=proportion)
+        )
+
+    def add_instantaneous_bottleneck(
+        self, time: float, *, population: Union[str, int], strength: float
+    ) -> InstantaneousBottleneck:
+        return self.add_event(
+            InstantaneousBottleneck(time=time, population=population, strength=strength)
+        )
+
+    def add_census(self, time: float) -> CensusEvent:
+        """
+        Add a "census" event at the specified time. In a census we add a node
+        to each branch of every tree, thus recording the population that each
+        lineage is in at the specified time.
+
+        This may be used to record all ancestral haplotypes present at that
+        time, and to extract other information related to these haplotypes: for
+        instance to trace the local ancestry of a sample back to a set of
+        contemporaneous ancestors, or to assess whether a subset of samples has
+        coalesced more recently than the census time.
+
+        See :ref:`sec_ancestry_census_events` for more details.
+        """
+        return self.add_event(CensusEvent(time))
 
     def _populations_table(self):
-        col_titles = [
-            "id",
-            "name",
-            "description",
-            "initial_size",
-            "growth_rate",
-            "extra_metadata",
+        cols = [
+            ("id", ""),
+            ("name", ""),
+            ("description", ""),
+            ("initial_size", ".1f"),
+            ("growth_rate", ".2g"),
+            ("default_sampling_time", ".2g"),
+            ("extra_metadata", ""),
         ]
-        data = []
-        for j, pop in enumerate(self.populations):
-            row = [str(j)] + [f"{getattr(pop, attr)}" for attr in col_titles[1:]]
-            data.append(row)
-        return col_titles, data
+        data = [
+            [f"{getattr(pop, attr):{fmt}}" for attr, fmt in cols]
+            for pop in self.populations
+        ]
+        return [title for title, _ in cols], data
 
     def _populations_text(self):
         col_titles, data = self._populations_table()
-        alignments = ["^", "<", "<", "<", "^", "<"]
+        alignments = ["^", "<", "<", "<", "^", ">", "<"]
         data = [
             [
                 [item.as_text() if isinstance(item, core.TableEntry) else item]
@@ -148,16 +532,21 @@ class Demography:
 
     def _populations_html(self):
         col_titles, data = self._populations_table()
-        return core.html_table("Populations", col_titles, data)
+        return core.html_table(
+            f"Populations ({len(self.populations)})", col_titles, data
+        )
 
     def _migration_rate_info(self, source, dest, rate):
         extra = None
         if source != dest:
+            source_name = self.populations[source].name
+            dest_name = self.populations[dest].name
             extra = (
                 "Backwards in time migration rate from population "
-                f"{self.populations[source].name} to {self.populations[dest].name} "
-                f"= {rate} per generation. "
-                "Equivalant to **IMPLEMENT ME** forwards in time"
+                f"{source_name} to {dest_name} = {rate} per generation. "
+                "Forwards in time, this is the expected number of migrants "
+                f"moving from {dest_name} to {source_name} "
+                f"per generation, divided by the size of {source_name}."
             )
         return core.TableEntry(f"{rate:.4g}", extra)
 
@@ -187,8 +576,11 @@ class Demography:
         )
 
     def _migration_matrix_html(self):
-        col_titles, data = self._migration_matrix_table()
-        return core.html_table("Migration matrix", col_titles, data)
+        if np.all(self.migration_matrix == 0):
+            return core.html_table("Migration matrix (all zero)", [], [])
+        else:
+            col_titles, data = self._migration_matrix_table()
+            return core.html_table("Migration matrix", col_titles, data)
 
     def _events_text(self, events, title="Events"):
         col_titles = [["time"], ["type"], ["parameters"], ["effect"]]
@@ -196,7 +588,7 @@ class Demography:
         data = []
         for event in events:
             type_text = textwrap.wrap(event._type_str, 15)
-            description = textwrap.wrap(event._parameters(), 20)
+            description = textwrap.wrap(event._parameters(), 22)
             effect = textwrap.wrap(event._effect(), 38)
             row = [[f"{event.time:.4g}"], type_text, description, effect]
             data.append(row)
@@ -204,7 +596,12 @@ class Demography:
             title, col_titles, alignments, data, internal_hlines=True
         )
 
-    def _events_html(self, events, title="Events"):
+    def _events_html(self, events, title=None):
+        if title is None:
+            title = f"Events ({len(events)})"
+        if len(self.events) == 0:
+            return core.html_table(title, [], [])
+
         col_titles = ["time", "type", "parameters", "effect"]
         data = []
         for event in events:
@@ -216,21 +613,23 @@ class Demography:
             )
             row = [f"{event.time:.4g}", type_html, event._parameters(), event._effect()]
             data.append(row)
-        return core.html_table(title, col_titles, data)
+        return core.html_table(title, col_titles, data, no_escape=[1])
 
     def _repr_html_(self):
+        resolved = self.validate()
         return (
-            "<p>"
-            + self._populations_html()
-            + self._migration_matrix_html()
-            + self._events_html(self.events)
-            + "</p>"
+            '<div style="margin-left:20px">'
+            + resolved._populations_html()
+            + resolved._migration_matrix_html()
+            + resolved._events_html(self.events)
+            + "</div>"
         )
 
     def __str__(self):
-        populations = self._populations_text()
-        migration_matrix = self._migration_matrix_text()
-        events = self._events_text(self.events)
+        resolved = self.validate()
+        populations = resolved._populations_text()
+        migration_matrix = resolved._migration_matrix_text()
+        events = resolved._events_text(self.events)
 
         def indent(table):
             lines = table.splitlines()
@@ -247,24 +646,38 @@ class Demography:
         )
         return s
 
-    def name_to_id(self, name):
+    def __getitem__(self, identifier):
         """
-        Returns the integer ID (i.e., its position in the list of populations)
-        of the population with the specified name. If the name does not exist,
-        raise a KeyError.
-
-        Note: this function will raise an error if called before the ``validate``
-        method is called.
-
-        :param str name: The name of the population we wish to look up.
-        :return: The integer ID of the population.
-        :rtype: int
+        Returns the population with the specified ID or name.
         """
-        if self.__name_id_map is None:
-            raise ValueError("Cannot call name_to_id before calling validate()")
-        if name not in self.__name_id_map:
-            raise KeyError(f"Population with name '{name}' not found in demography")
-        return self.__name_id_map[name]
+        if isinstance(identifier, str):
+            for population in self.populations:
+                if population.name == identifier:
+                    return population
+            else:
+                raise KeyError(f"Population with name '{identifier}' not found")
+        elif core.isinteger(identifier):
+            # We don't support negative indexing here because -1 is used as
+            # way to refer to *all* populations in demographic events, and
+            # it would be too easy to introduce bugs in old code if we changed
+            # the meaning of this.
+            if identifier < 0 or identifier >= self.num_populations:
+                raise KeyError(f"Population id {identifier} out of bounds")
+            return self.populations[identifier]
+        raise TypeError(
+            "Keys must be either string population names or integer IDs:"
+            f"identifier '{identifier}' is of type {type(identifier)}"
+        )
+
+    def __contains__(self, identifier):
+        """
+        Support "in" lookups, i.e. ``if "YRI" in demography``.
+        """
+        try:
+            self.__getitem__(identifier)
+        except KeyError:
+            return False
+        return True
 
     @property
     def num_populations(self):
@@ -274,11 +687,27 @@ class Demography:
     def num_events(self):
         return len(self.events)
 
+    def _validate_populations(self):
+        names = set()
+        for j, population in enumerate(self.populations):
+            if population.id != j:
+                raise ValueError(
+                    "Incorrect population ID. ID values should not be updated "
+                    "by users. Please use Demography.add_population to add extra "
+                    "populations after initialisation."
+                )
+            population.validate()
+            if population.name in names:
+                raise ValueError(f"Duplicate population name: '{population.name}'")
+            names.add(population.name)
+
     def validate(self):
         """
         Checks the demography looks sensible and raises errors/warnings
-        appropriately.
+        appropriately, and return a copy in which all default values have
+        been appropriately resolved.
         """
+        self._validate_populations()
         migration_matrix = np.array(self.migration_matrix)
         N = self.num_populations
         if migration_matrix.shape != (N, N):
@@ -290,25 +719,39 @@ class Demography:
                 "valid matrix for a 3 population system is "
                 "[[0, 1, 1], [1, 0, 1], [1, 1, 0]]"
             )
-
+        last_event = None
         for event in self.events:
             if not isinstance(event, DemographicEvent):
                 raise TypeError(
                     "Demographic events must be a list of DemographicEvent "
                     "instances sorted in non-decreasing order of time."
                 )
+            if last_event is not None:
+                if last_event.time > event.time:
+                    raise ValueError(
+                        "Events must be time-sorted. Please use demography.sort_events()"
+                        "if you add events out of order."
+                    )
+            last_event = event
+        resolved = copy.deepcopy(self)
+        for population in resolved.populations:
+            if population.default_sampling_time is None:
+                population.default_sampling_time = 0
+            if population.initially_active is None:
+                population.initially_active = True
+        return resolved
 
-        self.__name_id_map = {}
-        for j, population in enumerate(self.populations):
-            population.validate()
-            if population.name in self.__name_id_map:
-                raise ValueError(f"Duplicate population name: '{population.name}'")
-            self.__name_id_map[population.name] = j
+    def sort_events(self):
+        # Sort demographic events by time. Sorting is stable so the relative
+        # order of events at the same time will be preserved.
+        self.events.sort(key=lambda de: de.time)
 
     def insert_populations(self, tables):
         """
         Insert population definitions for this demography into the specified
         set of tables.
+
+        :meta private:
         """
         metadata_schema = tskit.MetadataSchema(
             {
@@ -347,7 +790,11 @@ class Demography:
             tables.populations.add_row(metadata=metadata)
 
     def asdict(self):
-        return dataclasses.asdict(self)
+        return {
+            "populations": [pop.asdict() for pop in self.populations],
+            "events": [event.asdict() for event in self.events],
+            "migration_matrix": self.migration_matrix.tolist(),
+        }
 
     def debug(self):
         """
@@ -359,14 +806,259 @@ class Demography:
         return DemographyDebugger(demography=self)
 
     def __eq__(self, other):
-        if isinstance(other, Demography):
-            return (
-                self.populations == other.populations
-                and np.array_equal(self.migration_matrix, other.migration_matrix)
-                and self.events == other.events
+        try:
+            self.assert_equal(other)
+            return True
+        except AssertionError:
+            return False
+
+    def assert_equal(self, other: Demography):
+        """
+        Compares this Demography with specified ``other`` and raises an
+        AssertionError if they are not exactly equal.
+
+        :param Demography other: The other demography to compare against.
+        """
+        # TODO we could potentially do better here with error messages
+        # by showing a diff of the str() values for objects that differ.
+        assert isinstance(other, Demography)
+        assert self.num_populations == other.num_populations
+        for p1, p2 in zip(self.populations, other.populations):
+            assert p1 == p2, f"{p1} ≠ {p2}"
+        assert np.array_equal(
+            self.migration_matrix, other.migration_matrix
+        )  # type: ignore
+        assert self.num_events == other.num_events
+        for e1, e2 in zip(self.events, other.events):
+            assert e1 == e2, f"{e1} ≠ {e2}"
+
+    def is_equivalent(self, other: Demography, rel_tol=None, abs_tol=None):
+        """
+        Compares this demography with the other and return True if they are
+        equivalent up to the specified numerical tolerances. Two demographies
+        are equivalent if, they have the same set of epochs defined by demographic
+        events, and for each epoch:
+
+        - The population's ``initial_size``, ``growth_rate`` and ``active``
+          values are equal in all populations.
+        - The migration matrices are equal
+        - The same sequence of lineage movements through population splits, etc.
+
+        All numerical comparisons are performed using :func:`py:math.isclose`.
+
+        :param Demography other: The other demography to compare against.
+        :param float rel_tol: The relative tolerance used by math.isclose.
+        :param float abs_tol: The relative tolerance used by math.isclose.
+        :return: True if this demography and other are equivalent up to numerical
+            tolerances.
+        :rtype bool: bool
+        """
+        try:
+            self.assert_equivalent(other, rel_tol=rel_tol, abs_tol=abs_tol)
+            return True
+        except AssertionError:
+            return False
+
+    def assert_equivalent(
+        self,
+        other: Demography,
+        rel_tol: Union[None, float] = None,
+        abs_tol: Union[None, float] = None,
+    ):
+        # Same defaults as math.isclose
+        rel_tol = 1e-9 if rel_tol is None else rel_tol
+        abs_tol = 0 if abs_tol is None else abs_tol
+        assert isinstance(other, Demography)
+        self_dbg = self.debug()
+        other_dbg = other.debug()
+        if self.num_populations != other.num_populations:
+            raise AssertionError(
+                "Number of populations not equal: "
+                f"{self.num_populations} ≠ {other.num_populations}"
             )
-        else:
-            return super().__eq__(other)
+        # Compare the population attributes.
+        # NB use the *resolved* versions from the debug objects
+        for self_pop, other_pop in zip(
+            self_dbg.demography.populations, other_dbg.demography.populations
+        ):
+            if self_pop.name != other_pop.name:
+                raise AssertionError(
+                    f"Population names differ: {self_pop.name} ≠ {other_pop.name}"
+                )
+            self_st = (
+                0
+                if self_pop.default_sampling_time is None
+                else self_pop.default_sampling_time
+            )
+            other_st = (
+                0
+                if other_pop.default_sampling_time is None
+                else other_pop.default_sampling_time
+            )
+            if not math.isclose(self_st, other_st):
+                raise AssertionError(
+                    f"Sampling times not equal for {self_pop.name}: "
+                    f"{self_pop.default_sampling_time} ≠ "
+                    f"{other_pop.default_sampling_time}"
+                )
+
+        if self_dbg.num_epochs != other_dbg.num_epochs:
+            raise AssertionError(
+                "Number of epochs not equal: "
+                f"{self_dbg.num_epochs} ≠ {other_dbg.num_epochs}"
+            )
+        for j, (self_epoch, other_epoch) in enumerate(
+            zip(self_dbg.epochs, other_dbg.epochs)
+        ):
+            if not math.isclose(
+                self_epoch.start_time,
+                other_epoch.start_time,
+                rel_tol=rel_tol,
+                abs_tol=abs_tol,
+            ):
+                raise AssertionError(
+                    f"Epoch[{j}] at different times: "
+                    f"{self_epoch.start_time} ≠ {other_epoch.start_time}"
+                )
+            for self_pop, other_pop in zip(
+                self_epoch.populations, other_epoch.populations
+            ):
+                if self_pop.state != other_pop.state:
+                    raise AssertionError(
+                        f"State mismatch in populations in epoch[{j}], {self_pop.name}: "
+                        f"{self_pop.state} ≠ {other_pop.state}"
+                    )
+                if self_pop.state == PopulationStateMachine.ACTIVE:
+                    if not math.isclose(
+                        self_pop.start_size,
+                        other_pop.start_size,
+                        rel_tol=rel_tol,
+                        abs_tol=abs_tol,
+                    ):
+                        raise AssertionError(
+                            "Population start_size not equal to required precision "
+                            f"in epoch[{j}], {self_pop.name}: "
+                            f"{self_pop.start_size} ≠ {other_pop.start_size}"
+                        )
+
+                    if not math.isclose(
+                        self_pop.growth_rate,
+                        other_pop.growth_rate,
+                        rel_tol=rel_tol,
+                        abs_tol=abs_tol,
+                    ):
+                        raise AssertionError(
+                            "Population growth_rate not equal to required precision "
+                            f"in epoch[{j}], {self_pop.name}: "
+                            f"{self_pop.growth_rate} ≠ {other_pop.growth_rate}"
+                        )
+            m_equal = np.isclose(
+                self_epoch.migration_matrix,
+                other_epoch.migration_matrix,
+                rtol=rel_tol,
+                atol=abs_tol,
+            )
+            if not np.all(m_equal):
+                differs = "Differences between: "
+                for source_id, dest_id in zip(*np.where(~m_equal)):
+                    source = self[source_id].name
+                    dest = self[dest_id].name
+                    self_rate = self_epoch.migration_matrix[source_id, dest_id]
+                    other_rate = other_epoch.migration_matrix[source_id, dest_id]
+                    differs += f"({source}, {dest}: {self_rate} ≠ {other_rate}), "
+                raise AssertionError(
+                    f"Migration matrices in epoch[{j}] not equal: \n"
+                    "self = \n"
+                    f"{self_epoch.migration_matrix}\n"
+                    "other = \n"
+                    f"{other_epoch.migration_matrix}\n"
+                    f"::{differs[:-2]}"
+                )
+            self._assert_lineage_movements_equivalent(
+                self_epoch.events, other_epoch.events, rel_tol=rel_tol, abs_tol=abs_tol
+            )
+
+            self_state_change = [
+                event
+                for event in self_epoch.events
+                if isinstance(event, StateChangeEvent)
+            ]
+            other_state_change = [
+                event
+                for event in other_epoch.events
+                if isinstance(event, StateChangeEvent)
+            ]
+            if len(self_state_change) > 0 or len(other_state_change) > 0:
+                raise ValueError(
+                    "State change events not currently supported in equivalent. "
+                    "Please open an issue on GitHub"
+                )
+
+    def _assert_lineage_movements_equivalent(
+        self, self_events, other_events, *, rel_tol, abs_tol
+    ):
+        self_lineage_movements = self._normalise_lineage_movements(self_events)
+        other_lineage_movements = self._normalise_lineage_movements(other_events)
+        source_pops = set(self_lineage_movements.keys())
+        if source_pops != set(other_lineage_movements.keys()):
+            raise AssertionError(
+                f"Mismatch in the set of populations affected by lineage movements: "
+                f"{source_pops} ≠ {set(other_lineage_movements.keys())}"
+            )
+        for source in source_pops:
+            self_out_movements = self_lineage_movements[source]
+            other_out_movements = other_lineage_movements[source]
+            if len(self_out_movements) != len(other_out_movements):
+                raise AssertionError(
+                    "Mismatch in number of normalised lineage movements out of "
+                    f"{source}: {len(self_out_movements)} ≠ {len(other_out_movements)}"
+                )
+            for self_lm, other_lm in zip(self_out_movements, other_out_movements):
+                if self_lm.dest != other_lm.dest:
+                    raise AssertionError(
+                        "Mismatch in lineage movement destination:"
+                        f"{self_lm.dest} ≠ {other_lm.dest}"
+                    )
+                if not math.isclose(
+                    self_lm.proportion,
+                    other_lm.proportion,
+                    rel_tol=rel_tol,
+                    abs_tol=abs_tol,
+                ):
+                    raise AssertionError(
+                        "Mismatch in normalised lineage movement proportions "
+                        f"from {self_lm.source} to {self_lm.dest}: "
+                        f"{self_lm.proportion} ≠ {other_lm.proportion}"
+                    )
+
+    def _normalise_lineage_movements(self, events: List[DemographicEvent]):
+        """
+        Extract the LineageMovementEvent instances from the specified list
+        and normalise their effects into LineageMovement instances, and
+        return a dictionary mapping source populations to the list of
+        sequential lineage movements. For each source population we have a
+        list of sequentual lineage movements, sorted by destination population ID.
+        """
+        assert len({event.time for event in events}) <= 1
+        ret = collections.defaultdict(list)
+        for event in events:
+            if isinstance(event, LineageMovementEvent):
+                for move in event._as_lineage_movements():
+                    ret[move.source].append(move)
+        for pop in list(ret.keys()):
+            # We have a list of *conditional* lineage movements out of a
+            # population. We canonicalise this by sorting by the
+            # destination population, so we have to first convert back to
+            # absolute proportions.
+            assert all(lm.source == pop for lm in ret[pop])
+            P = _sequential_to_proportions([pm.proportion for pm in ret[pop]])
+            id_value_pairs = sorted([(lm.dest, p) for lm, p in zip(ret[pop], P)])
+            S = _proportions_to_sequential([p for _, p in id_value_pairs])
+            ret[pop] = [
+                LineageMovement(source=pop, dest=id_value_pairs[j][0], proportion=S[j])
+                for j in range(len(S))
+            ]
+        return ret
 
     @staticmethod
     def from_species_tree(
@@ -376,7 +1068,7 @@ class Demography:
         time_units="gen",
         generation_time=None,
         growth_rate=None,
-    ):
+    ) -> Demography:
         """
         Parse a species tree in `Newick
         <https://en.wikipedia.org/wiki/Newick_format>`_ format and return the
@@ -393,19 +1085,11 @@ class Demography:
         the list. Leaf populations are first in the list, and added in
         left-to-right order. Populations corresponding to the internal nodes
         are then added in a postorder traversal of the species tree. For each
-        internal node, :class:`.MassMigration` events are added so that
-        lineages move from its child populations at the appropriate time.
-
-        :warning: If continuous migration is added to the returned Demography
-            by updating the migration matrix, it is important to
-            note that the MassMigration events used to move lineages do *not*
-            alter migration rates, and it should be ensured that
-            migration rates to source populations of mass migration events are zero
-            after the mass migration (viewed backwards in time).
-
-        :todo: Implement the PopulationSplit event and document its use here.
-            We'll still need to put in a warning, so users know that the migration
-            matrix will be updated at every node.
+        internal node a :class:`.PopulationSplit` event is added so that
+        lineages move from its child populations at the appropriate time
+        and rates of continuous migration to and from the child populations is
+        set to zero. See the :ref:`sec_demography_events_population_split`
+        section for more details.
 
         The initial sizes and growth rates for the populations in the model are
         set via the ``initial_size`` and ``growth_rate`` arguments. These can be
@@ -420,7 +1104,7 @@ class Demography:
             demography = msprime.Demography.from_species_tree(tree, initial_size)
 
         Note that it is possible to have default population sizes for unnamed
-        ancestral populations using a `collections.defaultdict`, e.g.,
+        ancestral populations using a :class:`python:collections.defaultdict`, e.g.,
 
         .. code-block:: python
 
@@ -456,7 +1140,7 @@ class Demography:
         )
 
     @staticmethod
-    def from_starbeast(tree, generation_time, time_units="myr"):
+    def from_starbeast(tree, generation_time, time_units="myr") -> Demography:
         """
         Parse a species tree produced by the program `TreeAnnotator
         <https://www.beast2.org/treeannotator>`_
@@ -475,26 +1159,19 @@ class Demography:
         trees written by TreeAnnotator based on StarBEAST posterior tree
         distributions.
 
-        The returned :class:`.Demography` object contains a :class:`.Population` for
-        each node in the species tree. The population's ``name`` attribute will
-        be either the corresponding node label from the newick tree, if it exists,
-        or otherwise the name takes the form "pop_{j}", where j is the position
-        of the given population in the list. Leaf populations are first in the
-        list, and added in left-to-right order. Populations corresponding to the
-        internal nodes are then added in a postorder traversal of the species
-        tree. For each internal node, :class:`.MassMigration` events are added
-        so that lineages move from its child populations at the appropriate time.
-
-        :warning: If continuous migration is added to the returned Demography
-            by updating the migration matrix, it is important to
-            note that the MassMigration events used to move lineages do *not*
-            alter migration rates, and it should be ensured that
-            migration rates to source populations of mass migration events are zero
-            after the mass migration (viewed backwards in time).
-
-        :todo: Implement the PopulationSplit event and document its use here.
-            We'll still need to put in a warning, so users know that the migration
-            matrix will be updated at every node.
+        The returned :class:`.Demography` object contains a
+        :class:`.Population` for each node in the species tree. The
+        population's ``name`` attribute will be either the corresponding node
+        label from the newick tree, if it exists, or otherwise the name takes
+        the form "pop_{j}", where j is the position of the given population in
+        the list. Leaf populations are first in the list, and added in
+        left-to-right order. Populations corresponding to the internal nodes
+        are then added in a postorder traversal of the species tree. For each
+        internal node a :class:`.PopulationSplit` event is added so that
+        lineages move from its child populations at the appropriate time and
+        rates of continuous migration to and from the child populations is set
+        to zero. See the :ref:`sec_demography_events_population_split` section
+        for more details.
 
         :param str tree: The tree string in Nexus format, with named leaves, branch
             lengths, and branch annotation. Typically, this string is the entire content
@@ -514,37 +1191,302 @@ class Demography:
             time_units=time_units,
         )
 
+    def _from_old_style_map_populations(
+        population_configurations: List[PopulationConfiguration],
+        migration_matrix: List[List[float]],
+        demographic_events: List[DemographicEvent],
+        population_map: [List[Dict[int, str]]],
+    ) -> Demography:
+        direct_model = Demography._from_old_style_simple(
+            population_configurations, migration_matrix, demographic_events
+        )
+
+        for id_map in population_map:
+            if len(set(id_map.values())) != len(id_map):
+                raise ValueError("Population IDs in old model must be unique")
+            for old_id in id_map.values():
+                if old_id < 0 or old_id >= direct_model.num_populations:
+                    raise ValueError(
+                        f"Bad population reference {old_id} in old style model"
+                    )
+        if len(population_map[0]) != len(population_configurations):
+            raise ValueError(
+                "The ID map for the first epoch must have entries for all "
+                "populations in the old-style model"
+            )
+
+        # Suppress misspecification warnings; we'll give more specific messages
+        # later.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dbg = direct_model.debug()
+
+        if dbg.num_epochs != len(population_map):
+            raise ValueError(
+                "Mismatch in the number of epochs in the old style model "
+                f"({dbg.num_epochs}) and specified in the population ID map "
+                f"({len(population_map)})"
+            )
+
+        demography = Demography()
+        # Set up the initial state of the model
+        id_map = population_map[0]
+        for new_name, old_id in id_map.items():
+            pc = population_configurations[old_id]
+            demography._add_population_from_old_style(pc, new_name)
+        for epoch_id_map in population_map[1:]:
+            for name in epoch_id_map.keys():
+                if name not in demography:
+                    demography.add_population(name=name, initial_size=0)
+
+        # Fill out migration matrix
+        for pop_1, pop_2 in itertools.combinations(id_map.keys(), 2):
+            for pop_j, pop_k in [(pop_1, pop_2), (pop_2, pop_1)]:
+                j = id_map[pop_j]
+                k = id_map[pop_k]
+                demography.set_migration_rate(
+                    source=pop_j, dest=pop_k, rate=direct_model.migration_matrix[j, k]
+                )
+
+        # Set the state of populations and migration rates epoch by epoch.
+        for epoch in dbg.epochs[1:]:
+            epoch_id_map = population_map[epoch.index]
+            # Set the population sizes and growth_rates for the extant populations.
+            for new_id, old_id in epoch_id_map.items():
+                pop_state = epoch.populations[old_id]
+                demography.add_population_parameters_change(
+                    epoch.start_time,
+                    population=new_id,
+                    initial_size=pop_state.start_size,
+                    growth_rate=pop_state.growth_rate,
+                )
+            # Set the migration rates.
+            for pop_1, pop_2 in itertools.combinations(epoch_id_map.keys(), 2):
+                for pop_j, pop_k in [(pop_1, pop_2), (pop_2, pop_1)]:
+                    j = epoch_id_map[pop_j]
+                    k = epoch_id_map[pop_k]
+                    demography.add_migration_rate_change(
+                        time=epoch.start_time,
+                        source=pop_j,
+                        dest=pop_k,
+                        rate=epoch.migration_matrix[j][k],
+                    )
+
+        # Add splits/admixtures/pulses according to the mass migrations in the
+        # original model and ID maps.
+        last_epoch_id_map = population_map[0]
+        for epoch in dbg.epochs:
+            logger.debug(
+                f"Converting epoch[{epoch.index}] "
+                f"{epoch.start_time:.2f}-{epoch.end_time:.2f}"
+            )
+            # New name -> old ID
+            epoch_id_map = population_map[epoch.index]
+            # Old ID -> new name
+            old_id_map = {value: key for key, value in epoch_id_map.items()}
+            last_epoch_pops = set(last_epoch_id_map.keys())
+            epoch_pops = set(epoch_id_map.keys())
+            derived = set()
+            events = copy.deepcopy(epoch.events)
+            old_derived_ids = []
+            if last_epoch_pops != epoch_pops:
+                ancestral = epoch_pops - last_epoch_pops
+                derived = last_epoch_pops - epoch_pops
+                old_derived_ids = []
+                if len(ancestral) == 1:
+                    logger.debug(
+                        f"Adding split ancestral={ancestral} derived={derived}"
+                    )
+                    ancestral = ancestral.pop()
+                    demography.add_population_split(
+                        time=epoch.start_time,
+                        derived=list(derived),
+                        ancestral=ancestral,
+                    )
+                    old_derived_ids = [last_epoch_id_map[pop] for pop in derived]
+                    derived_mass_migrations = 0
+                    for event in events:
+                        if isinstance(event, MassMigration):
+                            if event.source in old_derived_ids:
+                                derived_mass_migrations += 1
+                            if event.proportion != 1:
+                                raise ValueError(
+                                    "MassMigration associated with population split "
+                                    "with proportion != 1"
+                                )
+                    # This check is weak, but it will catch some errors at least.
+                    # We're assuming the old model is well-formed, so this should
+                    # help catch errors where the id map is slightly off.
+                    if derived_mass_migrations < len(old_derived_ids) - 1:
+                        raise ValueError(
+                            "Insufficient MassMigrations found for population split"
+                        )
+                elif len(derived) == 1:
+                    derived = derived.pop()
+                    ancestral = []
+                    sequential_proportions = []
+                    old_derived_id = last_epoch_id_map[derived]
+                    for event in events:
+                        if event.source == old_derived_id:
+                            ancestral.append(old_id_map[event.dest])
+                            sequential_proportions.append(event.proportion)
+                    proportions = _sequential_to_proportions(sequential_proportions)
+                    if math.isclose(sum(proportions), 1):
+                        if len(ancestral) == 1:
+                            # This is a single split from the ancestral population,
+                            # which continues to exist. We need to override the
+                            # defaults for the behaviour we want here.
+                            logger.debug(
+                                f"Adding single split ancestral={ancestral[0]} "
+                                f"derived={derived}"
+                            )
+                            pop = demography[ancestral[0]]
+                            pop.initially_active = True
+                            pop.default_sampling_time = None
+                            demography.add_population_split(
+                                time=epoch.start_time,
+                                derived=[derived],
+                                ancestral=ancestral[0],
+                            )
+                        else:
+                            logger.debug(
+                                f"Adding admixture ancestral={ancestral} "
+                                f"derived={derived} proportions={proportions}"
+                            )
+                            demography.add_admixture(
+                                time=epoch.start_time,
+                                derived=derived,
+                                ancestral=ancestral,
+                                proportions=proportions,
+                            )
+                        old_derived_ids = [old_derived_id]
+                    else:
+                        raise ValueError(
+                            "Admixture or single population split implied by ID map "
+                            "but absolute population proportions don't sum to 1"
+                        )
+            for event in events:
+                if isinstance(event, MassMigration):
+                    if event.source not in old_derived_ids:
+                        demography.add_mass_migration(
+                            time=epoch.start_time,
+                            source=old_id_map[event.source],
+                            dest=old_id_map[event.dest],
+                            proportion=event.proportion,
+                        )
+                elif not isinstance(
+                    event, (MigrationRateChange, PopulationParametersChange)
+                ):
+                    raise ValueError(
+                        "Only MassMigration, MigrationRateChange and "
+                        "PopulationParametersChange events are supported"
+                    )
+
+            # Go through the inactive populations and check the migration
+            # rates make sense. It's an error to migrate out of an inactive
+            # population and a warning to migrate out of inactive pops.
+            pairs = itertools.combinations(range(len(epoch.populations)), 2)
+            active = set(epoch_id_map.values())
+            for pop_1, pop_2 in pairs:
+                for source, dest in [(pop_1, pop_2), (pop_2, pop_1)]:
+                    if epoch.migration_matrix[source, dest] != 0:
+                        if source in active and dest not in active:
+                            raise ValueError(
+                                "Non zero migration from an active population "
+                                f"({source}) to inactive ({dest})"
+                            )
+                        if source not in active:
+                            warnings.warn(
+                                "Migration out of inactive population "
+                                f"({source}) to ({dest}). This may be an "
+                                "error in your model."
+                            )
+
+            last_epoch_id_map = epoch_id_map
+
+        demography.sort_events()
+        return demography
+
     @staticmethod
-    def from_old_style(
+    def _from_old_style_simple(
         population_configurations=None,
         migration_matrix=None,
         demographic_events=None,
-        Ne=1,
-    ):
+    ) -> Demography:
         """
         Creates a Demography object from the pre 1.0 style input parameters,
         reproducing the old semantics with respect to default values.
         """
         demography = Demography()
-        if population_configurations is None:
-            demography.populations = [Population(initial_size=Ne)]
-        else:
-            for pop_config in population_configurations:
-                demography.populations.append(Population.from_old_style(pop_config, Ne))
-        for j, population in enumerate(demography.populations):
-            if population.name is None:
-                population.name = f"pop_{j}"
-        if migration_matrix is None:
-            migration_matrix = np.zeros(
-                (demography.num_populations, demography.num_populations)
-            )
-        demography.migration_matrix = migration_matrix
+        for pop_config in population_configurations:
+            demography._add_population_from_old_style(pop_config)
+        if migration_matrix is not None:
+            demography.migration_matrix = np.array(migration_matrix)
         if demographic_events is not None:
-            demography.events = demographic_events
+            for event in demographic_events:
+                demography.add_event(copy.deepcopy(event))
         return demography
 
     @staticmethod
-    def isolated_model(initial_size, *, growth_rate=None):
+    def from_old_style(
+        population_configurations=None,
+        *,
+        migration_matrix=None,
+        demographic_events=None,
+        Ne=1,
+        ignore_sample_size=False,
+        population_map: Union[[List[Dict[int, Union[str, int]]]], None] = None,
+    ) -> Demography:
+        """
+        Creates a Demography object from the pre 1.0 style input parameters,
+        reproducing the old semantics with respect to default values.
+
+        No sample information is stored in the new-style :class:`.Demography`
+        objects, and therefore if the ``sample_size`` attribute of any
+        of the input :class:`.PopulationConfiguration` objects is set a
+        ValueError will be raised by default. However, if the
+        ``ignore_sample_size`` parameter is set to True, this check will
+        not be performed and the sample sizes specified in the old-style
+        :class:`.PopulationConfiguration` objects will be ignored.
+
+        Please see the :ref:`sec_ancestry_samples` section for details on
+        how to specify sample locations in :func:`.sim_ancestry`.
+
+        .. todo:: Document the remaining parameters.
+        """
+        if population_configurations is None:
+            pop_configs = [PopulationConfiguration(initial_size=Ne)]
+        else:
+            pop_configs = copy.deepcopy(population_configurations)
+            for pop_config in pop_configs:
+                if pop_config.initial_size is None:
+                    pop_config.initial_size = Ne
+
+                if pop_config.sample_size is not None and not ignore_sample_size:
+                    raise ValueError(
+                        "You have specified a `sample_size` in a "
+                        "PopulationConfiguration object that is to be converted "
+                        "into a new-style Demography object, "
+                        "which does not contain any information about samples. "
+                        "Please use the ``samples`` argument to sim_ancestry "
+                        "instead, which provides flexible options for sampling "
+                        "from different populations"
+                    )
+
+        if population_map is None:
+            return Demography._from_old_style_simple(
+                pop_configs, migration_matrix, demographic_events
+            )
+        else:
+            return Demography._from_old_style_map_populations(
+                pop_configs,
+                migration_matrix,
+                demographic_events,
+                population_map,
+            )
+
+    @staticmethod
+    def isolated_model(initial_size, *, growth_rate=None) -> Demography:
         """
         Returns a :class:`.Demography` object representing a collection of
         isolated populations with specified initial population sizes and
@@ -586,14 +1528,13 @@ class Demography:
             Population(
                 initial_size=initial_size[j],
                 growth_rate=growth_rate[j],
-                name=f"pop_{j}",
             )
             for j in range(len(initial_size))
         ]
         return Demography(populations=populations)
 
     @staticmethod
-    def island_model(initial_size, migration_rate, *, growth_rate=None):
+    def island_model(initial_size, migration_rate, *, growth_rate=None) -> Demography:
         """
         Returns a :class:`.Demography` object representing a collection of
         populations with specified initial population sizes and growth
@@ -623,7 +1564,7 @@ class Demography:
     @staticmethod
     def stepping_stone_model(
         initial_size, migration_rate, *, growth_rate=None, boundaries=False
-    ):
+    ) -> Demography:
         """
         Returns a :class:`.Demography` object representing a collection of
         populations with specified initial population sizes and growth
@@ -631,9 +1572,9 @@ class Demography:
         specified rate. Please see :ref:`sec_demography` for more details on
         population sizes and growth rates.
 
-        .. note:: The current implementation on supports a one-dimensional stepping
-            stone model, but higher dimensions could also be supported. Please
-            open an issue on GitHub if this feature would be useful to you.
+        .. note:: The current implementation only supports a one-dimensional
+            stepping stone model, but higher dimensions could also be supported.
+            Please open an issue on GitHub if this feature would be useful to you.
 
         :param array_like initial_size: the ``initial_size`` value for each
             of the :class:`.Population` in the returned model. The length
@@ -670,166 +1611,324 @@ class Demography:
                 model.migration_matrix[-1, 0] = 0
         return model
 
-    # TODO commenting these two out for now in the interest of getting the
-    # main changes merged. We can update the code to include these models
-    # ported in from stdpopsim as a follow up.
+    @staticmethod
+    def _ooa_model():
+        """
+        Returns the Gutenkunst et al three population out-of-Africa model.
 
-    # @staticmethod
-    # def piecewise_constant_size(N0, *args):
-    #     """
-    #     Returns a piecewise constant size demographic model, which allows for
-    #     instantaneous population size change over multiple epochs in a single
-    #     population.
+        This version is included here temporarily as a way to get some
+        test coverage on the model compared with stdpopsim. Because we
+        use this model in the documentation, we want make sure that it's
+        doing what we think. We compare the model defined here then with
+        the one presented in the docs, to ensure that no errors creep in.
 
-    #     :ivar N0: The initial effective population size
-    #     :vartype N0: float
-    #     :ivar args: Each subsequent argument is a tuple (t, N) which gives the
-    #         time at which the size change takes place and the population size.
+        Once the upstream code in stdpopsim is updated to use msprime 1.0
+        APIs we can remove this model and instead compare directly
+        to the stdpopsim model with .is_equivalent() or whatever.
+        """
+        # Times are provided in years, so we convert into generations.
+        generation_time = 25
+        T_OOA = 21.2e3 / generation_time
+        T_AMH = 140e3 / generation_time
+        T_ANC = 220e3 / generation_time
+        # We need to work out the starting (diploid) population sizes based on
+        # the growth rates provided for these two populations
+        r_CEU = 0.004
+        r_CHB = 0.0055
+        N_CEU = 1000 / math.exp(-r_CEU * T_OOA)
+        N_CHB = 510 / math.exp(-r_CHB * T_OOA)
 
-    #     The usage is best illustrated by an example:
+        demography = Demography()
+        demography.add_population(
+            name="YRI",
+            description="Yoruba in Ibadan, Nigeria",
+            initial_size=12300,
+        )
+        demography.add_population(
+            name="CEU",
+            description=(
+                "Utah Residents (CEPH) with Northern and Western European Ancestry"
+            ),
+            initial_size=N_CEU,
+            growth_rate=r_CEU,
+        )
+        demography.add_population(
+            name="CHB",
+            description="Han Chinese in Beijing, China",
+            initial_size=N_CHB,
+            growth_rate=r_CHB,
+        )
+        demography.add_population(
+            name="OOA",
+            description="Bottleneck out-of-Africa population",
+            initial_size=2100,
+        )
+        demography.add_population(
+            name="AMH", description="Anatomically modern humans", initial_size=12300
+        )
+        demography.add_population(
+            name="ANC",
+            description="Ancestral equilibrium population",
+            initial_size=7300,
+        )
 
-    #     .. code-block:: python
+        # Set the migration rates between extant populations
+        demography.set_symmetric_migration_rate(["CEU", "CHB"], 9.6e-5)
+        demography.set_symmetric_migration_rate(["YRI", "CHB"], 1.9e-5)
+        demography.set_symmetric_migration_rate(["YRI", "CEU"], 3e-5)
 
-    #         # One change
-    #         model1 = msprime.Demography.piecewise_constant_size(N0, (t1, N1))
-    #         # Two changes
-    #         model2 = msprime.Demography.piecewise_constant_size(
-    #             N0, (t1, N1), (t2, N2))
-    #     """
-    #     model = Demography()
-    #     model.populations = [
-    #         Population(
-    #             initial_size=N0,
-    #             name="pop_0",
-    #             description="Population in piecewise constant model",
-    #         )
-    #     ]
-    #     model.migration_matrix = [[0]]
-    #     model.demographic_events = []
-    #     for t, N in args:
-    #         model.demographic_events.append(
-    #             PopulationParametersChange(
-    #                 time=t, initial_size=N, growth_rate=0, population=0
-    #             )
-    #         )
-    #     return model
+        demography.add_population_split(
+            time=T_OOA, derived=["CEU", "CHB"], ancestral="OOA"
+        )
+        demography.add_symmetric_migration_rate_change(
+            time=T_OOA, populations=["YRI", "OOA"], rate=25e-5
+        )
+        demography.add_population_split(
+            time=T_AMH, derived=["YRI", "OOA"], ancestral="AMH"
+        )
+        demography.add_population_split(time=T_ANC, derived=["AMH"], ancestral="ANC")
+        return demography
 
-    # @staticmethod
-    # def im_model(N0, N1, NA, T, M01, M10):
-    #     """
-    #     An isolation with migration model where a single ancestral
-    #     population of size NA splits into two populations of constant size N0
-    #     and N1 at time T generations ago, with migration rates M01 and M10 between
-    #     the split populations. Sampling is disallowed in population index 2,
-    #     as this is the ancestral population.
+    def _ooa_trunk_model():
+        """
+        Returns the Gutenkunst et al three population out-of-Africa model,
+        rendered in a more "old-style" way where we merge the various
+        populations back into Africa.
 
-    #     .. fixme:: Not clear what direction the migration rates are here.
+        This version is included here temporarily as a way to get some
+        test coverage on the model compared with stdpopsim. Because we
+        use this model in the documentation, we want make sure that it's
+        doing what we think. We compare the model defined here then with
+        the one presented in the docs, to ensure that no errors creep in.
 
-    #     :ivar N0: The effective population size of population 0
-    #     :vartype N0: float
-    #     :ivar N1: The effective population size of population 1
-    #     :vartype N1: float
-    #     :ivar NA: The ancestral effective population size (population 2).
-    #     :vartype NA: float
-    #     :ivar T: Time of split between populations 0 and 1 (in generations)
-    #     :vartype T: float
-    #     :ivar M01: Migration rate from population 0 to 1
-    #     :vartype M01: float
-    #     :ivar M10: Migration rate from population M10
-    #     :vartype M10: float
+        Once the upstream code in stdpopsim is updated to use msprime 1.0
+        APIs we can remove this model and instead compare directly
+        to the stdpopsim model with .is_equivalent() or whatever.
+        """
+        # Times are provided in years, so we convert into generations.
+        generation_time = 25
+        T_OOA = 21.2e3 / generation_time
+        T_AMH = 140e3 / generation_time
+        T_ANC = 220e3 / generation_time
+        # We need to work out the starting (diploid) population sizes based on
+        # the growth rates provided for these two populations
+        r_CEU = 0.004
+        r_CHB = 0.0055
+        N_CEU = 1000 / math.exp(-r_CEU * T_OOA)
+        N_CHB = 510 / math.exp(-r_CHB * T_OOA)
 
-    #     Example usage:
+        demography = Demography()
+        # This is the "trunk" population that we merge other populations into
+        demography.add_population(
+            name="YRI",
+            description="Africa",
+            initial_size=12300,
+            initially_active=True,
+        )
+        demography.add_population(
+            name="CEU",
+            description="European",
+            initial_size=N_CEU,
+            growth_rate=r_CEU,
+        )
+        demography.add_population(
+            name="CHB",
+            description="East Asian",
+            initial_size=N_CHB,
+            growth_rate=r_CHB,
+        )
+        demography.add_population(
+            name="OOA",
+            description="Bottleneck out-of-Africa population",
+            initial_size=2100,
+        )
 
-    #     .. code-block:: python
+        # Set the migration rates between extant populations
+        demography.set_symmetric_migration_rate(["CEU", "CHB"], 9.6e-5)
+        demography.set_symmetric_migration_rate(["YRI", "CHB"], 1.9e-5)
+        demography.set_symmetric_migration_rate(["YRI", "CEU"], 3e-5)
 
-    #         model = msprime.Demography.im_model(N0, N1, NA, T, M12, M21)
-    #     """
-    #     model = Demography()
-    #     model.populations = [
-    #         Population(initial_size=N0),
-    #         Population(initial_size=N1),
-    #         Population(initial_size=NA),
-    #     ]
-    #     model.migration_matrix = [[0, M01, 0], [M10, 0, 0], [0, 0, 0]]
-    #     model.demographic_events = [
-    #         MassMigration(time=T, source=0, destination=2, proportion=1),
-    #         MassMigration(time=T, source=1, destination=2, proportion=1),
-    #     ]
-    #     return model
-
-
-# TODO fixup the documentation here. This definition is partly lifted
-# from stdpopsim and also derived from PopulationConfiguration. The
-# idea is that PopulationConfiguration is to be maintained
-# indefinitely as the old-style interface, but we convert to Population
-# internally. Getting rid of PopConfig makes sense for two reasons:
-# 1) it's a clunky and confusing name and 2) The sample_size
-# attribute makes things really awkward, as it conflates declaring
-# structure and how you sample from it.
-
-
-@dataclasses.dataclass
-class Population:
-    """
-    Define a single population in a simulation.
-
-    :ivar initial_size: The absolute size of the population at time zero.
-    :vartype initial_size: float
-    :var growth_rate: The exponential growth rate of the
-        population per generation (forwards in time).
-        Growth rates can be negative. This is zero for a
-        constant population size, and positive for a population that has been
-        growing. Defaults to 0.
-    :vartype growth_rate: float
-    :ivar name: The name of the population. If specified this must be a uniquely
-        identifying string.
-    :vartype name: str
-    :ivar description: a short description of the population
-    :vartype description: str
-    """
-
-    initial_size: float
-    growth_rate: float = 0.0
-    name: Union[str, None] = None
-    description: Union[str, None] = None
-    extra_metadata: dict = dataclasses.field(default_factory=dict)
-    sampling_time: float = 0
-
-    def asdict(self):
-        return dataclasses.asdict(self)
+        demography.add_population_split(
+            time=T_OOA, derived=["CEU", "CHB"], ancestral="OOA"
+        )
+        demography.add_symmetric_migration_rate_change(
+            time=T_OOA, populations=["YRI", "OOA"], rate=25e-5
+        )
+        demography.add_population_split(time=T_AMH, derived=["OOA"], ancestral="YRI")
+        demography.add_population_parameters_change(
+            time=T_ANC, population="YRI", initial_size=7300
+        )
+        return demography
 
     @staticmethod
-    def from_old_style(pop_config, Ne=1):
+    def _ooa_archaic_model():
         """
-        Returns a Population object derived from the specified old-style
-        PopulationConfiguration. The Ne value is used as the ``initial_size``
-        if this is not provided in the PopulationConfiguration.
+        See notes for the _ooa model above.
         """
-        initial_size = (
-            Ne if pop_config.initial_size is None else pop_config.initial_size
-        )
-        population = Population(
-            initial_size=initial_size,
-            growth_rate=pop_config.growth_rate,
-        )
-        metadata = pop_config.metadata
-        if metadata is not None and isinstance(metadata, collections.abc.Mapping):
-            metadata = metadata.copy()
-            if "name" in metadata:
-                population.name = metadata.pop("name")
-            if "description" in metadata:
-                population.description = metadata.pop("description")
-        population.extra_metadata = metadata
-        return population
+        # Implement the OutOfAfricaArchaicAdmixture_5R19 model
+        # NOTE: this example isn't very well factored and needs more work.
 
-    def validate(self):
-        # TODO more checks
-        if self.initial_size < 0:
-            raise ValueError("Negative population size")
-        if self.name is None:
-            raise ValueError("A population name must be set.")
-        if not self.name.isidentifier():
-            raise ValueError("A population name must be a valid Python identifier")
+        # Times are provided in years, so we convert into generations.
+        generation_time = 29
+        T_OOA = 36_000 / generation_time
+        T_AMH = 60_700 / generation_time
+        T_ANC = 300_000 / generation_time
+        T_ArchaicAFR = 499_000 / generation_time
+        T_Neanderthal = 559_000 / generation_time
+        T_archaic_migration_start = 18_700 / generation_time
+        T_archaic_migration_end = 125_000 / generation_time
+
+        # We need to work out the starting (diploid) population sizes based on
+        # the growth rates provided for these two populations
+        r_CEU = 0.00125
+        r_CHB = 0.00372
+        N_CEU = 2300 / math.exp(-r_CEU * T_OOA)
+        N_CHB = 650 / math.exp(-r_CHB * T_OOA)
+
+        demography = Demography()
+        # This is the "trunk" population that we merge other populations into
+        demography.add_population(
+            name="AFR",
+            description="African population",
+            initial_size=13900,
+            initially_active=True,
+        )
+        demography.add_population(
+            name="CEU",
+            description=(
+                "Utah Residents (CEPH) with Northern and Western European Ancestry"
+            ),
+            initial_size=N_CEU,
+            growth_rate=r_CEU,
+        )
+        demography.add_population(
+            name="CHB",
+            description="Han Chinese in Beijing, China",
+            initial_size=N_CHB,
+            growth_rate=r_CHB,
+        )
+        demography.add_population(
+            name="Neanderthal",
+            description="Putative Neanderthals",
+            initial_size=3600,
+        )
+        demography.add_population(
+            name="ArchaicAFR",
+            description="Putative Archaic Africans",
+            initial_size=3600,
+        )
+        demography.add_population(
+            name="OOA",
+            description="Bottleneck out-of-Africa population",
+            initial_size=880,
+        )
+
+        # Set the migration rates between extant populations
+        demography.set_symmetric_migration_rate(["CEU", "CHB"], 11.3e-5)
+        demography.set_symmetric_migration_rate(["AFR", "CEU"], 2.48e-5)
+
+        demography.add_symmetric_migration_rate_change(
+            T_archaic_migration_start, ["CEU", "Neanderthal"], 0.825e-5
+        )
+        demography.add_symmetric_migration_rate_change(
+            T_archaic_migration_start, ["CHB", "Neanderthal"], 0.825e-5
+        )
+        demography.add_symmetric_migration_rate_change(
+            T_archaic_migration_start, ["ArchaicAFR", "AFR"], 1.98e-5
+        )
+        demography.add_migration_rate_change(T_archaic_migration_end, rate=0)
+
+        demography.add_population_split(
+            time=T_OOA, derived=["CEU", "CHB"], ancestral="OOA"
+        )
+        demography.add_symmetric_migration_rate_change(
+            time=T_OOA, populations=["AFR", "OOA"], rate=52.2e-5
+        )
+        demography.add_symmetric_migration_rate_change(
+            time=T_OOA, populations=["OOA", "Neanderthal"], rate=0.825e-5
+        )
+        demography.add_population_split(time=T_AMH, derived=["OOA"], ancestral="AFR")
+        demography.add_symmetric_migration_rate_change(
+            T_AMH, ["ArchaicAFR", "AFR"], 1.98e-5
+        )
+        demography.add_population_parameters_change(
+            time=T_AMH, population="AFR", initial_size=13900
+        )
+        demography.add_population_parameters_change(
+            time=T_ANC, population="AFR", initial_size=3600
+        )
+        demography.add_population_split(
+            time=T_ArchaicAFR, derived=["ArchaicAFR"], ancestral="AFR"
+        )
+        demography.add_population_split(
+            time=T_Neanderthal, derived=["Neanderthal"], ancestral="AFR"
+        )
+        demography.sort_events()
+        return demography
+
+    @staticmethod
+    def _american_admixture_model():
+        # Implementation of AmericanAdmixture_4B11 model. See notes from the _ooa
+        # model above as to why this is here.
+        T_OOA = 920
+        N_EUR = 34039
+        r_EUR = 0.0038
+        N_EAS = 45852
+        r_EAS = 0.0048
+        T_ADMIX = 12
+        N_ADMIX = 54664
+        r_ADMIX = 0.05
+
+        demography = Demography()
+        demography.add_population(name="AFR", description="African", initial_size=14474)
+        demography.add_population(
+            name="EUR",
+            description="European",
+            initial_size=N_EUR,
+            growth_rate=r_EUR,
+        )
+        demography.add_population(
+            name="EAS",
+            description="East Asian",
+            initial_size=N_EAS,
+            growth_rate=r_EAS,
+        )
+        demography.add_population(
+            name="ADMIX",
+            description="Admixed America",
+            initial_size=N_ADMIX,
+            growth_rate=r_ADMIX,
+        )
+        demography.add_admixture(
+            T_ADMIX,
+            derived="ADMIX",
+            ancestral=["AFR", "EUR", "EAS"],
+            proportions=[1 / 6, 2 / 6, 3 / 6],
+        )
+        demography.add_population(
+            name="OOA",
+            description="Bottleneck out-of-Africa",
+            initial_size=1861,
+        )
+        demography.add_population(
+            name="AMH", description="Anatomically modern humans", initial_size=14474
+        )
+        demography.add_population(
+            name="ANC",
+            description="Ancestral equilibrium",
+            initial_size=7310,
+        )
+        demography.set_symmetric_migration_rate(["AFR", "EUR"], 2.5e-5)
+        demography.set_symmetric_migration_rate(["AFR", "EAS"], 0.78e-5)
+        demography.set_symmetric_migration_rate(["EUR", "EAS"], 3.11e-5)
+
+        demography.add_population_split(T_OOA, derived=["EUR", "EAS"], ancestral="OOA")
+        demography.add_symmetric_migration_rate_change(
+            time=T_OOA, populations=["AFR", "OOA"], rate=15e-5
+        )
+        demography.add_population_split(2040, derived=["OOA", "AFR"], ancestral="AMH")
+        demography.add_population_split(5920, derived=["AMH"], ancestral="ANC")
+        return demography
 
 
 # This was lifted out of older code as-is. No point in updating it
@@ -878,6 +1977,17 @@ class PopulationConfiguration:
         )
 
 
+def _list_str(a: List, fmt=None):
+    """
+    Returns the specified items rendered as a string without quotes.
+    """
+    if fmt is None:
+        joined = ", ".join(str(item) for item in a)
+    else:
+        joined = ", ".join(f"{item:{fmt}}" for item in a)
+    return f"[{joined}]"
+
+
 @dataclasses.dataclass
 class DemographicEvent:
     """
@@ -885,6 +1995,9 @@ class DemographicEvent:
     """
 
     time: float
+    demography: Demography = dataclasses.field(
+        init=False, compare=False, default=None, repr=False
+    )
 
     def _parameters(self):
         raise NotImplementedError()
@@ -899,9 +2012,39 @@ class DemographicEvent:
             if hasattr(self, key)
         }
 
+    def _convert_id(self, population_ref):
+        """
+        Converts the specified population reference into an integer,
+        suitable for input into the low-level code. We treat -1 as a special
+        case because it's used as meaning "all populations" by the events.
+        """
+        if population_ref in [-1, None]:
+            # Both of these mean "all populations"
+            return -1
+        if self.demography is None:
+            # We need to be able to handle Events that are not associated with
+            # a Demography to support old code. However, these should only ever
+            # happen with integer IDs.
+            if not core.isinteger(population_ref):
+                raise ValueError(
+                    "Working with demographic events not associated with a "
+                    "Demography object is a legacy-only operation. Population "
+                    "references must be integer IDs"
+                )
+            return population_ref
+        return self.demography[population_ref].id
+
+
+class ParameterChangeEvent(DemographicEvent):
+    """
+    Superclass of events that change some parameters in the underlying
+    simulation model but don't actually affect the state in any other
+    way.
+    """
+
 
 @dataclasses.dataclass
-class PopulationParametersChange(DemographicEvent):
+class PopulationParametersChange(ParameterChangeEvent):
     """
     Changes the demographic parameters of a population at a given time.
 
@@ -953,7 +2096,7 @@ class PopulationParametersChange(DemographicEvent):
         ret = {
             "type": "population_parameters_change",
             "time": self.time,
-            "population": self.population,
+            "population": self._convert_id(self.population),
         }
         if self.growth_rate is not None:
             ret["growth_rate"] = self.growth_rate
@@ -972,11 +2115,11 @@ class PopulationParametersChange(DemographicEvent):
     def _effect(self):
         s = ""
         if self.initial_size is not None:
-            s += f"initial_size → {self.initial_size} "
+            s += f"initial_size → {self.initial_size:.2g} "
             if self.growth_rate is not None:
                 s += "and "
         if self.growth_rate is not None:
-            s += f"growth_rate → {self.growth_rate} "
+            s += f"growth_rate → {self.growth_rate:.3g} "
         s += "for"
         if self.population == -1:
             s += " all populations"
@@ -986,7 +2129,7 @@ class PopulationParametersChange(DemographicEvent):
 
 
 @dataclasses.dataclass
-class MigrationRateChange(DemographicEvent):
+class MigrationRateChange(ParameterChangeEvent):
     """
     Changes the rate of migration from one deme to another to a new value at a
     specific time. Migration rates are specified in terms of the rate at which
@@ -1029,9 +2172,12 @@ class MigrationRateChange(DemographicEvent):
         return {
             "type": "migration_rate_change",
             "time": self.time,
+            # Note: We'd like to change the name here to "rate" but it's best
+            # to leave this alone until stdpopsim has been moved away from
+            # using this internal API.
             "migration_rate": self.rate,
-            "source": self.source,
-            "dest": self.dest,
+            "source": self._convert_id(self.source),
+            "dest": self._convert_id(self.dest),
         }
 
     def _parameters(self):
@@ -1047,8 +2193,82 @@ class MigrationRateChange(DemographicEvent):
         return ret
 
 
+# TODO not clear we want to document this as part of the external API.
 @dataclasses.dataclass
-class MassMigration(DemographicEvent):
+class SymmetricMigrationRateChange(ParameterChangeEvent):
+    """
+    Sets the symmetric migration rate between all pairs of populations in
+    the specified list to the specified value. For a given pair of population
+    IDs ``j`` and ``k``, this sets ``migration_matrix[j, k] = rate``
+    and ``migration_matrix[k, j] = rate``.
+
+    Populations may be specified either by their integer IDs or by
+    their string names.
+
+    :param float time: The time at which this event occurs in generations.
+    :param list populations: An iterable of population identifiers (integer
+        IDs or string names).
+    :param float rate: The new migration rate.
+    """
+
+    populations: List[Union[int, str]]
+    rate: float
+
+    _type_str: ClassVar[str] = dataclasses.field(
+        default="Symmetric migration rate change", repr=False
+    )
+
+    def get_ll_representation(self, num_populations=None):
+        # We need to keep the num_populations argument until stdpopsim 0.1 is out
+        # https://github.com/tskit-dev/msprime/issues/1037
+        return {
+            "type": "symmetric_migration_rate_change",
+            "time": self.time,
+            "populations": [self._convert_id(pop) for pop in self.populations],
+            "rate": self.rate,
+        }
+
+    def _parameters(self):
+        return f"populations={_list_str(self.populations)}, rate={self.rate}"
+
+    def _effect(self):
+        s = "Sets the symmetric migration rate between "
+        if len(self.populations) == 2:
+            s += f"{self.populations[0]} and {self.populations[1]} "
+        else:
+            s += f"all pairs of populations in {_list_str(self.populations)} "
+        s += f"to {self.rate} per generation"
+        return s
+
+
+@dataclasses.dataclass
+class LineageMovement:
+    """
+    A single instantaneous movement of lineages from one population to
+    another. Note that 'source' and 'dest' are in the backwards-in-time
+    sense.
+    """
+
+    source: int
+    dest: int
+    proportion: float
+
+
+class LineageMovementEvent(DemographicEvent):
+    """
+    Superclass of events that move lineages around between populations.
+    """
+
+    def _as_lineage_movements(self) -> List[LineageMovement]:
+        """
+        Returns the equivalent of this lineage movement event as a
+        list of lineage movements.
+        """
+        raise NotImplementedError()
+
+
+@dataclasses.dataclass
+class MassMigration(LineageMovementEvent):
     """
     A mass migration event in which some fraction of the population in one deme
     (the ``source``) simultaneously move to another deme (``dest``) during the
@@ -1091,25 +2311,171 @@ class MassMigration(DemographicEvent):
         return {
             "type": "mass_migration",
             "time": self.time,
-            "source": self.source,
-            "dest": self.dest,
+            "source": self._convert_id(self.source),
+            "dest": self._convert_id(self.dest),
             "proportion": self.proportion,
         }
 
     def _parameters(self):
-        return f"source={self.source}, dest={self.dest}, proportion={self.proportion}"
+        return (
+            f"source={self.source}, dest={self.dest}, proportion={self.proportion:.3g}"
+        )
 
     def _effect(self):
-        return (
-            f"Lineages currently in population {self.source} move to {self.dest} "
-            f"with probability {self.proportion} (equivalent to individuals "
+        if self.proportion == 1.0:
+            ret = (
+                f"All lineages currently in population {self.source} move "
+                f"to {self.dest} "
+            )
+        else:
+            ret = (
+                f"Lineages currently in population {self.source} move to {self.dest} "
+                f"with probability {self.proportion:.3g} "
+            )
+        ret += (
+            "(equivalent to individuals "
             f"migrating from {self.dest} to {self.source} forwards in time)"
         )
+        return ret
+
+    def _as_lineage_movements(self):
+        return [
+            LineageMovement(
+                source=self._convert_id(self.source),
+                dest=self._convert_id(self.dest),
+                proportion=self.proportion,
+            )
+        ]
+
+
+@dataclasses.dataclass
+class PopulationSplit(LineageMovementEvent):
+    """
+
+    :param float time: The time at which this event occurs in generations.
+    :param list(int) derived: The ID(s) of the derived population(s).
+    :param int ancestral: The ID of the ancestral population.
+    """
+
+    derived: List[Union[int, str]]
+    ancestral: Union[int, str]
+
+    _type_str: ClassVar[str] = dataclasses.field(default="Population Split", repr=False)
+
+    def get_ll_representation(self, num_populations=None):
+        # We need to keep the num_populations argument until stdpopsim 0.1 is out
+        # https://github.com/tskit-dev/msprime/issues/1037
+        return {
+            "type": "population_split",
+            "time": self.time,
+            "derived": [self._convert_id(pop) for pop in self.derived],
+            "ancestral": self._convert_id(self.ancestral),
+        }
+
+    def _parameters(self):
+        return f"derived={_list_str(self.derived)}, ancestral={self.ancestral}"
+
+    def _effect(self):
+        s = "Moves all lineages from "
+        if len(self.derived) == 1:
+            s += f"the '{self.derived[0]}' derived population "
+        else:
+            s += "derived populations "
+            if len(self.derived) == 2:
+                s += f"'{self.derived[0]}' and '{self.derived[1]}' "
+            else:
+                s += f"{_list_str(self.derived)} "
+        s += f"to the ancestral '{self.ancestral}' population. "
+        s += "Also set "
+        if len(self.derived) == 1:
+            s += f"'{self.derived[0]}' "
+        else:
+            s += "the derived populations "
+        s += (
+            "to inactive, and all migration rates to and from "
+            f"the derived population{'s' if len(self.derived) > 1 else ''} "
+            "to zero."
+        )
+
+        return s
+
+    def _as_lineage_movements(self):
+        ancestral = self._convert_id(self.ancestral)
+        return [
+            LineageMovement(source=self._convert_id(pop), dest=ancestral, proportion=1)
+            for pop in self.derived
+        ]
+
+
+@dataclasses.dataclass
+class Admixture(LineageMovementEvent):
+    """
+
+    :param float time: The time at which this event occurs in generations.
+    """
+
+    derived: Union[int, str]
+    ancestral: List[Union[int, str]]
+    proportions: List[float]
+
+    _type_str: ClassVar[str] = dataclasses.field(default="Admixture", repr=False)
+
+    @property
+    def num_ancestral(self):
+        return len(self.ancestral)
+
+    def get_ll_representation(self, num_populations=None):
+        # We need to keep the num_populations argument until stdpopsim 0.1 is out
+        # https://github.com/tskit-dev/msprime/issues/1037
+        return {
+            "type": "admixture",
+            "time": self.time,
+            "derived": self._convert_id(self.derived),
+            "ancestral": [self._convert_id(pop) for pop in self.ancestral],
+            "proportions": self.proportions,
+        }
+
+    def _parameters(self):
+        return (
+            f"derived={self.derived} ancestral={_list_str(self.ancestral)} "
+            f"proportions={_list_str(self.proportions, '.2f')}"
+        )
+
+    def _effect(self):
+        move_to = "; ".join(
+            f"'{pop}' with proba {proba:.3g}"
+            for pop, proba in zip(self.ancestral, self.proportions)
+        )
+        return (
+            f"Moves all lineages from admixed population '{self.derived}' "
+            f"to ancestral population{'s' if len(self.ancestral) > 1 else ''}. "
+            f"Lineages move to {move_to}. Set '{self.derived}' to inactive, "
+            f"and all migration rates to and from '{self.derived}' to zero."
+        )
+
+    def _as_lineage_movements(self):
+        derived = self._convert_id(self.derived)
+        ancestral = [self._convert_id(pop) for pop in self.ancestral]
+        # Conditioned on having already distributed a fraction q of the
+        # lineages, the we need a fraction p / (1 - q) of the remaining
+        # lineages to get an overall proportion of p.
+        S = _proportions_to_sequential(self.proportions)
+        return [
+            LineageMovement(source=derived, dest=ancestral[j], proportion=S[j])
+            for j in range(self.num_ancestral)
+        ]
+
+
+class StateChangeEvent(DemographicEvent):
+    """
+    Superclass of events that change the state of the simulation in complex
+    ways.
+    """
 
 
 # This is an unsupported/undocumented demographic event.
 @dataclasses.dataclass
-class SimpleBottleneck(DemographicEvent):
+class SimpleBottleneck(StateChangeEvent):
     population: int
     proportion: float = 1.0
 
@@ -1119,7 +2485,7 @@ class SimpleBottleneck(DemographicEvent):
         return {
             "type": "simple_bottleneck",
             "time": self.time,
-            "population": self.population,
+            "population": self._convert_id(self.population),
             "proportion": self.proportion,
         }
 
@@ -1139,7 +2505,7 @@ class SimpleBottleneck(DemographicEvent):
 
 # TODO document
 @dataclasses.dataclass
-class InstantaneousBottleneck(DemographicEvent):
+class InstantaneousBottleneck(StateChangeEvent):
     population: int
     strength: float = 1.0
 
@@ -1149,7 +2515,7 @@ class InstantaneousBottleneck(DemographicEvent):
         return {
             "type": "instantaneous_bottleneck",
             "time": self.time,
-            "population": self.population,
+            "population": self._convert_id(self.population),
             "strength": self.strength,
         }
 
@@ -1196,30 +2562,33 @@ class CensusEvent(DemographicEvent):
         return "Insert census nodes to record the location of all lineages"
 
 
-@dataclasses.dataclass
-class PopulationState:
+def _sequential_to_proportions(S):
     """
-    Simple class to represent the state of a population in terms of its
-    demographic parameters.
+    Given a list of sequential lineage proportions out of a population,
+    return the absolute proportions of the original population this
+    corresponds to.
     """
+    P = []
+    for j in range(len(S)):
+        P.append(S[j] * (1 - sum(P[:j])))
+    return P
 
-    start_size: float
-    end_size: float
-    growth_rate: float
 
-
-@dataclasses.dataclass
-class Epoch:
+def _proportions_to_sequential(P):
     """
-    Represents a single epoch in the simulation within which the state
-    of the demographic parameters are constant.
+    Given a list of absolute proportions of lineages moving out of
+    a population, return the sequential conditional movements required
+    to give them same proportions.
     """
-
-    start_time: float
-    end_time: float
-    populations: List[PopulationState]
-    migration_matrix: list  # TODO numpy array
-    demographic_events: List[DemographicEvent]
+    # Conditioned on having already distributed a fraction q of the
+    # lineages, the we need a fraction p / (1 - q) of the remaining
+    # lineages to get an overall proportion of p
+    C = [0 for _ in P]
+    for j in range(len(P)):
+        s = sum(P[:j])
+        if s < 1:
+            C[j] = P[j] / (1 - s)
+    return C
 
 
 def _matrix_exponential(A):
@@ -1236,10 +2605,98 @@ def _matrix_exponential(A):
     return np.real_if_close(B, tol=1000)
 
 
+class PopulationStateMachine(enum.IntEnum):
+    """
+    During a simulation each population has three possible states described
+    by this state machine. In general, a population follows:
+
+    INACTIVE -> ACTIVE -> PREVIOUSLY_ACTIVE
+
+    All populations are by default ACTIVE at the start of the simulation,
+    except if they are they are "ancestral" in a population split event.
+    In this case populations are initially INACTIVE. A population
+    then transitions from INACTIVE -> ACTIVE when the corresponding
+    population split event occurs.
+
+    Populations transition from ACTIVE -> PREVIOUSLY_ACTIVE when they
+    are "derived" in either population split or admixture events.
+
+    No other transitions are possible.
+    """
+
+    INACTIVE = 0
+    ACTIVE = 1
+    PREVIOUSLY_ACTIVE = 2
+
+
+@dataclasses.dataclass
+class PopulationState:
+    """
+    Simple class to represent the state of a population in terms of its
+    demographic parameters. Note: start and end here refer to time flowing
+    *backwards*!
+    """
+
+    id: int  # noqa: A003
+    name: str
+    start_size: float
+    end_size: float
+    growth_rate: float
+    state: int
+
+    @property
+    def active(self):
+        return self.state == PopulationStateMachine.ACTIVE
+
+
+@dataclasses.dataclass
+class Epoch:
+    """
+    Represents a single epoch in the simulation within which the state
+    of the demographic parameters are constant.
+    """
+
+    index: int
+    start_time: float
+    end_time: float
+    populations: List[PopulationState]
+    migration_matrix: list  # TODO numpy array
+    events: List[DemographicEvent]
+
+    def _title_text(self):
+        return (
+            f"Epoch[{self.index}]: "
+            f"[{self.start_time:.3g}, {self.end_time:.3g}) generations"
+        )
+
+    def _population_state_text(self):
+        return (
+            f"Populations "
+            f"(total={len(self.populations)} active={self.num_active_populations})"
+        )
+
+    @property
+    def demographic_events(self):
+        # For compatibility with msprime 0.x
+        return self.events
+
+    @property
+    def active_populations(self):
+        return [pop for pop in self.populations if pop.active]
+
+    @property
+    def num_active_populations(self):
+        return len(self.active_populations)
+
+
 class DemographyDebugger:
     """
-    A class to facilitate debugging of population parameters and migration
-    rates in the past.
+    Utilities to compute and display information about the state of populations
+    during the different simulation epochs defined by demographic events.
+
+    .. warning:: This class is not intended to be instantiated directly using
+        the contructor - please use :meth:`.Demography.debug()` to obtain
+        a DemographyDebugger for a given :class:`.Demography` instead.
     """
 
     def __init__(
@@ -1257,29 +2714,21 @@ class DemographyDebugger:
             # Support the pre-1.0 syntax
             demography = Demography.from_old_style(
                 population_configurations,
-                migration_matrix,
-                demographic_events,
+                migration_matrix=migration_matrix,
+                demographic_events=demographic_events,
                 Ne=Ne,
+                ignore_sample_size=True,
             )
-        self.demography = demography
+        self.demography = demography.validate()
         self.num_populations = demography.num_populations
         self._make_epochs()
         self._check_misspecification()
 
     def _make_epochs(self):
         self.epochs = []
-        # We don't actually use the samples, this is just to get the simulator
-        # correctly initialised.
-        samples = {}
-        for j, pop in enumerate(self.demography.populations):
-            if pop.initial_size > 0 and pop.sampling_time == 0:
-                samples[j] = 1
-        if len(samples) == 0:
-            raise ValueError("No population with non-zero initial size.")
         simulator = ancestry._parse_sim_ancestry(
-            demography=self.demography, samples=samples
+            demography=self.demography, init_for_debugger=True
         )
-
         start_time = 0
         end_time = 0
         abs_tol = 1e-9
@@ -1294,19 +2743,28 @@ class DemographyDebugger:
                 event_index += 1
             end_time = simulator.debug_demography()
             migration_matrix = simulator.migration_matrix
-            growth_rates = [
-                conf["growth_rate"] for conf in simulator.population_configuration
-            ]
+            pop_conf = simulator.population_configuration
             populations = [
                 PopulationState(
+                    id=j,
+                    name=self.demography.populations[j].name,
                     start_size=simulator.compute_population_size(j, start_time),
                     end_size=simulator.compute_population_size(j, end_time),
-                    growth_rate=growth_rates[j],
+                    growth_rate=pop_conf[j]["growth_rate"],
+                    state=PopulationStateMachine(pop_conf[j]["state"]),
                 )
                 for j in range(self.num_populations)
             ]
+            epoch_index = len(self.epochs)
             self.epochs.append(
-                Epoch(start_time, end_time, populations, migration_matrix, events)
+                Epoch(
+                    epoch_index,
+                    start_time,
+                    end_time,
+                    populations,
+                    migration_matrix,
+                    events,
+                )
             )
             start_time = end_time
 
@@ -1316,11 +2774,12 @@ class DemographyDebugger:
         """
         merged_pops = set()
         for epoch in self.epochs:
-            for de in epoch.demographic_events:
+            for de in epoch.events:
                 if isinstance(de, MassMigration) and de.proportion == 1:
                     merged_pops.add(de.source)
             mm = epoch.migration_matrix
-            for k in merged_pops:
+            for pop_k in merged_pops:
+                k = self.demography[pop_k].id
                 if any(mm[k, :] != 0) or any(mm[:, k] != 0):
                     warnings.warn(
                         "Non-zero migration rates exist after merging "
@@ -1328,59 +2787,67 @@ class DemographyDebugger:
                         "demographic misspecification."
                     )
 
-    def _populations_html(self, epoch):
-        column_titles = ["", "start", "end", "growth_rate"] + [
-            pop.name for pop in self.demography.populations
-        ]
+    def _populations_table(self, epoch, as_text=True):
+        active_populations = epoch.active_populations
+        column_titles = ["", "start", "end", "growth_rate"]
+        if len(active_populations) > 1:
+            column_titles += [pop.name for pop in active_populations]
         data = []
-        for j, pop in enumerate(epoch.populations):
+        for pop in active_populations:
             row = [
-                self.demography.populations[j].name,
-                f"{pop.start_size: .3g}",
-                f"{pop.end_size: .3g}",
+                pop.name,
+                f"{pop.start_size: .1f}",
+                f"{pop.end_size: .1f}",
                 f"{pop.growth_rate: .3g}",
             ]
-            for k in range(self.demography.num_populations):
-                item = self.demography._migration_rate_info(
-                    j, k, epoch.migration_matrix[j, k]
-                )
-                row.append(item)
+            if len(active_populations) > 1:
+                for other_pop in active_populations:
+                    item = self.demography._migration_rate_info(
+                        pop.id,
+                        other_pop.id,
+                        epoch.migration_matrix[pop.id, other_pop.id],
+                    )
+                    if as_text:
+                        row.append(item.as_text())
+                    else:
+                        row.append(item)
+
             data.append(row)
-        return core.html_table("", column_titles, data)
+        return column_titles, data
+
+    def _populations_html(self, epoch):
+        column_titles, data = self._populations_table(epoch, as_text=False)
+        return core.html_table(epoch._population_state_text(), column_titles, data)
 
     def _populations_text(self, epoch):
-        column_titles = [[""], ["start"], ["end"], ["growth_rate"]] + [
-            [pop.name] for pop in self.demography.populations
-        ]
-        alignments = ">>><" + "^" * self.demography.num_populations
-        data = []
-        for j, pop in enumerate(epoch.populations):
-            row = [
-                [self.demography.populations[j].name],
-                [f"{pop.start_size: .3g}"],
-                [f"{pop.end_size: .3g}"],
-                [f"{pop.growth_rate: .3g}"],
-            ]
-            for k in range(self.demography.num_populations):
-                row.append([f"{epoch.migration_matrix[j, k]:.3g}"])
-            data.append(row)
-        return core.text_table("Population state", column_titles, alignments, data)
+        column_titles, data = self._populations_table(epoch)
+        alignments = ">>><"
+        if epoch.num_active_populations > 1:
+            alignments += "^" * epoch.num_active_populations
+        # Repack the table items as lists
+        column_titles = [[x] for x in column_titles]
+        data = [[[x] for x in row] for row in data]
+        return core.text_table(
+            epoch._population_state_text(), column_titles, alignments, data
+        )
 
     def _repr_html_(self):
         out = ""
-        for j, epoch in enumerate(self.epochs):
-            if j > 0:
-                if len(epoch.demographic_events) > 0:
-                    title = f"Events @ generation {epoch.start_time}"
-                    out += self.demography._events_html(epoch.demographic_events, title)
-                out += "</p>"
+        for epoch in self.epochs:
+            if epoch.index > 0:
+                assert len(epoch.events) > 0
+                title = f"Events @ generation {epoch.start_time:.3g}"
+                out += self.demography._events_html(epoch.events, title)
+                out += "</div></details>"
             else:
-                assert len(epoch.demographic_events) == 0
-            epoch_title = f"Epoch: {epoch.start_time} -- {epoch.end_time} generations"
-            out += "<p>"
-            out += f"<h3>{epoch_title}</h3>"
+                assert len(epoch.events) == 0
+            title = epoch._title_text()
+            out += f'<details open="true"><summary>{title}</summary>'
+            # Indent the content div slightly
+            out += '<div style="margin-left:20px">'
             out += self._populations_html(epoch)
-        out += "</p>"
+        out += "</div>"
+        out += "</details>"
         return f"<div>{out}</div>"
 
     def print_history(self, output=sys.stdout):
@@ -1406,15 +2873,12 @@ class DemographyDebugger:
             return f"{top}\n║ {title} ║\n{bottom}\n"
 
         out = "DemographyDebugger\n"
-        for j, epoch in enumerate(self.epochs):
-            if j > 0:
-                if len(epoch.demographic_events) > 0:
-                    title = f"Events @ generation {epoch.start_time}"
-                    out += indent(
-                        self.demography._events_text(epoch.demographic_events, title)
-                    )
-            epoch_title = f"Epoch: {epoch.start_time} -- {epoch.end_time} generations"
-            out += box(epoch_title)
+        for epoch in self.epochs:
+            if epoch.index > 0:
+                assert len(epoch.events) > 0
+                title = f"Events @ generation {epoch.start_time:.3g}"
+                out += indent(self.demography._events_text(epoch.events, title))
+            out += box(epoch._title_text())
             out += indent(self._populations_text(epoch))
         return out
 
@@ -1445,8 +2909,9 @@ class DemographyDebugger:
         ago.
 
         This function reports sampling probabilities _before_ mass migration events
-        at a step time, if a mass migration event occurs at one of those times.
-        Migrations will then effect the next time step.
+        (or other events that move lineages) at a step time, if a mass migration
+        event occurs at one of those times. Migrations will then effect the next
+        time step.
 
         :param list steps: A list of times to compute probabilities.
         :param sample_time: The time of sampling of the lineage. For any times in steps
@@ -1494,9 +2959,13 @@ class DemographyDebugger:
         mass_migration_objects = []
         mass_migration_times = []
         for demo in self.demography.events:
-            if isinstance(demo, MassMigration):
-                mass_migration_objects.append(demo)
-                mass_migration_times.append(demo.time)
+            if isinstance(demo, LineageMovementEvent):
+                # Convert higher-level lineage movement events like Admixtures
+                # and PopulationSplits into LineageMovement instances. These are
+                # equivalent to MassMigrations
+                for lm in demo._as_lineage_movements():
+                    mass_migration_objects.append(lm)
+                    mass_migration_times.append(demo.time)
 
         for jj in range(first_step, len(all_steps) - 1):
             t_j = all_steps[jj]
@@ -1532,11 +3001,27 @@ class DemographyDebugger:
         Given the sampling configuration, this function determines when lineages are
         possibly found within each population over epochs defined by demographic events
         and sampling times. If no sampling configuration is given, we assume we sample
-        lineages from every population at time zero. The samples are specified by a list
-        of msprime Sample objects, so that possible ancient samples may be accounted for.
+        lineages from every population at time zero.
 
-        :param list samples: A list of msprime Sample objects, which specify their
-            populations and times.
+        The epoch intervals returned are those in which there are *distinct*
+        configurations of possible lineage locations, and so the number of
+        returned epochs may be less than the total number of epochs defined
+        by the demography and will depend on the input sample configuration.
+
+        The samples are specified by either a list of population identifiers (
+        integer IDs or string names) or by a list of :class:`.SampleSet` objects,
+        allowing sampling times to be specified explicitly. If the ``time`` field
+        of the :class:`.SampleSet` is not specified (or population IDs are used)
+        samples are taken at the population's `default_sampling_time`. Only
+        :class:`.SampleSet` objects with ``num_samples > 0`` are counted as
+        contributing samples to a particular population.
+
+        To support legacy code, :class:`.Sample` objects from the 0.x API
+        can also provided, although its use is discouraged in new code.
+
+        :param list samples: The populations that we sample from. Can be either
+            a list of population identifiers, :class:`.SampleSet` or
+            :class:`.Sample` objects.
         :return: Returns a dictionary with epoch intervals as keys whose values are a
             list with length equal to the number of populations with True and False
             indicating which populations could possibly contain lineages over that
@@ -1544,15 +3029,34 @@ class DemographyDebugger:
             The first epoch necessarily starts at time 0, and the final epoch has end
             time of infinity.
         """
-        # get configuration of sampling times from samples ({time:[pops_sampled_from]})
         if samples is None:
-            sampling_times = {0: [i for i in range(self.num_populations)]}
-        else:
-            sampling_times = collections.defaultdict(list)
-            for sample in samples:
-                sampling_times[sample.time].append(sample.population)
-            for t in sampling_times.keys():
-                sampling_times[t] = list(set(sampling_times[t]))
+            samples = [
+                pop.id
+                for pop in self.demography.populations
+                if pop.default_sampling_time == 0
+            ]
+
+        # get configuration of sampling times from samples ({time:[pops_sampled_from]})
+        sampling_times = collections.defaultdict(list)
+        for sample in samples:
+            if isinstance(sample, (ancestry.Sample, ancestry.SampleSet)):
+                pop_id = self.demography[sample.population].id
+                sample_time = (
+                    self.demography[pop_id].default_sampling_time
+                    if sample.time is None
+                    else sample.time
+                )
+                if isinstance(sample, ancestry.SampleSet) and sample.num_samples <= 0:
+                    # If someone specifies 0 samples it should not be counted
+                    continue
+            else:
+                # Assume this is a population identifier.
+                pop = self.demography[sample]
+                pop_id = pop.id
+                sample_time = pop.default_sampling_time
+            sampling_times[sample_time].append(pop_id)
+        for t in sampling_times.keys():
+            sampling_times[t] = list(set(sampling_times[t]))
 
         all_steps = sorted(
             list(set([t for t in self.epoch_times] + list(sampling_times.keys())))

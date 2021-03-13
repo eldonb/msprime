@@ -76,6 +76,7 @@ import dendropy
 import matplotlib
 import numpy as np
 import pandas as pd
+import pyslim
 import pyvolve
 import scipy.special
 import scipy.stats
@@ -179,6 +180,63 @@ def write_slim_script(outfile, format_dict):
         f.write(slim_str.format(**format_dict))
 
 
+def write_sweep_slim_script(outfile, format_dict):
+    slim_str = """
+        initialize() {{
+        initializeTreeSeq();
+        initializeMutationRate(0);
+        initializeMutationType('m1', 0.5, 'f', 0.0);
+        initializeMutationType('m2', 0.5, 'f', {s});
+        initializeGenomicElementType('g1', m1, 1.0);
+        initializeGenomicElement(g1, 0, {NUMLOCI});
+        initializeRecombinationRate({r});
+        }}
+        s1 200000 late() {{
+                sim.treeSeqOutput('{OUTFILE}');
+                    sim.simulationFinished();
+        }}
+
+        1 {{
+            // save this run's identifier, used to save and restore
+            defineConstant("simID", getSeed());
+            sim.addSubpop("p1", {POPSIZE});
+            sim.setValue("flag",0);
+        }}
+
+        2 late() {{
+            // save the state of the simulation
+            sim.treeSeqOutput("/tmp/slim_" + simID + ".trees");
+            target = sample(p1.genomes, 1);
+            target.addNewDrawnMutation(m2, {SWEEPPOS});
+        }}
+        2:2000 late() {{
+            if (sim.countOfMutationsOfType(m2) == 0)
+            {{
+                fixed = (sum(sim.substitutions.mutationType == m2) == 1);
+                if (fixed){{
+                    sim.setValue("flag", sim.getValue("flag") + 1);
+                    }}
+                if (fixed)
+                {{
+                    if (sim.getValue("flag") == 1){{
+                        sim.rescheduleScriptBlock(s1,
+                        start=sim.generation+{TAU}, end=sim.generation+{TAU});
+                    }}
+                }}
+                else
+                {{
+                    sim.readFromPopulationFile("/tmp/slim_" + simID + ".trees");
+                    setSeed(rdunif(1, 0, asInteger(2^62) - 1));
+                    target = sample(p1.genomes, 1);
+                    target.addNewDrawnMutation(m2, {SWEEPPOS});
+                }}
+            }}
+        }}
+        """
+    with open(outfile, "w") as f:
+        f.write(slim_str.format(**format_dict))
+
+
 def subsample_simplify_slim_treesequence(ts, sample_sizes):
     tables = ts.dump_tables()
     samples = set(ts.samples())
@@ -206,8 +264,15 @@ def plot_qq(v1, v2):
     sm.qqplot_2samples(v1, v2, line="45")
 
 
-def plot_breakpoints_hist(v1, v2, v1_name, v2_name):
+def plot_stat_hist(v1, v2, v1_name, v2_name):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sns.kdeplot(v1, color="b", shade=True, label=v1_name, legend=False)
+        sns.kdeplot(v2, color="r", shade=True, label=v2_name, legend=False)
+        pyplot.legend(loc="upper right")
 
+
+def plot_breakpoints_hist(v1, v2, v1_name, v2_name):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         sns.kdeplot(v1, color="b", label=v1_name, shade=True, legend=False)
@@ -257,12 +322,19 @@ class Test:
             if stat == "breakpoints":
                 plot_breakpoints_hist(flatten(v1), flatten(v2), df1_name, df2_name)
                 pyplot.xlabel("genome")
+                f = self._build_filename(stats_type, stat)
+                pyplot.savefig(f, dpi=72)
             else:
                 plot_qq(v1, v2)
                 pyplot.xlabel(df1_name)
                 pyplot.ylabel(df2_name)
-            f = self._build_filename(stats_type, stat)
-            pyplot.savefig(f, dpi=72)
+                f = self._build_filename(stats_type, stat)
+                pyplot.savefig(f, dpi=72)
+                pyplot.close("all")
+                plot_stat_hist(v1, v2, df1_name, df2_name)
+                f = self._build_filename(stats_type, stat)
+                f = str(f) + ".hist.png"
+                pyplot.savefig(f, dpi=72)
             pyplot.close("all")
 
     def get_ms_seeds(self):
@@ -724,27 +796,36 @@ class DiscoalTest(Test):
                 theta = float(tokens[i + 1])
             if tokens[i] == "-r":
                 rho = float(tokens[i + 1])
-        mod_list = [None]
+        mod_list = [("hudson")]
         if alpha is not None:
             # sweep model
+            s = alpha / (2 * refsize)
             mod = msprime.SweepGenicSelection(
-                position=sweep_site,
+                position=np.floor(sweep_site * seq_length),
                 start_frequency=1.0 / (2 * refsize),
                 end_frequency=1.0 - (1.0 / (2 * refsize)),
-                alpha=alpha,
-                dt=1.0 / (40 * refsize),
+                s=s * 2,  # discoal fitness model is 1, 1+s, 1+2s
+                dt=1e-6,
             )
             mod_list.append((sweep_mod_time, mod))
+            # if an event is defined from discoal line
+            # best thing to do is rescale to Ne=0.25
+            # so that time scale are consistent
+            # see note at msprime/cli.py line 626
+            # and following for alternate solution
+            if sweep_mod_time > 0:
+                refsize = 0.25
+                mod.s = alpha / refsize
         # append final model
-        mod_list.append((None, None))
+        mod_list.append((None, "hudson"))
         # scale theta and rho and create recomb_map
         recomb_map = msprime.RecombinationMap.uniform_map(
-            seq_length, rho / (seq_length - 1)
+            seq_length, rho / 4 / refsize / (seq_length - 1)
         )
-        mu = theta / seq_length
+        mu = theta / 4 / refsize / seq_length
         replicates = msprime.simulate(
             sample_size,
-            Ne=0.25,
+            Ne=refsize,
             model=mod_list,
             recombination_map=recomb_map,
             mutation_rate=mu,
@@ -814,13 +895,223 @@ class DiscoalSweeps(DiscoalTest):
         cmd = "10 1000 10000 -t 10.0 -r 10.0"
         self._run(cmd)
 
-    def test_sweep_ex1(self):
-        cmd = "10 1000 10000 -t 10.0 -r 10.0 -ws 0 -a 500 -x 0.5 -N 10000"
+    def test_sweep_no_rec_ex1(self):
+        cmd = "10 1000 10000 -t 10.0 -r 0.0 -ws 0 -a 100 -x 0.5 -N 10000"
         self._run(cmd)
 
-    def test_sweep_ex2(self):
-        cmd = "10 1000 10000 -t 10.0 -r 10.0 -ws 0 -a 5000 -x 0.5 -N 10000"
+    def test_sweep_no_rec_ex2(self):
+        cmd = "10 1000 10000 -t 10.0 -r 0.0 -ws 0 -a 200 -x 0.5 -N 10000"
         self._run(cmd)
+
+    def test_sweep_rec_ex1(self):
+        cmd = "10 1000 10000 -t 10.0 -r 10.0 -ws 0 -a 1000 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_rec_ex2(self):
+        cmd = "10 1000 10000 -t 10.0 -r 20.0 -ws 0 -a 1000 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_rec_ex3(self):
+        cmd = "10 1000 10000 -t 10.0 -r 100.0 -ws 0 -a 1000 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_rec_ex4(self):
+        cmd = "10 1000 10000 -t 10.0 -r 400.0 -ws 0 -a 2000 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_rec_ex5(self):
+        cmd = "10 1000 10000 -t 100.0 -r 100.0 -ws 0 -a 250 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_tau_ex1(self):
+        cmd = "10 1000 10000 -t 10.0 -r 20.0 -ws 0.001 -a 250 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_tau_ex2(self):
+        cmd = "10 1000 10000 -t 10.0 -r 20.0 -ws 0.01 -a 250 -x 0.5 -N 10000"
+        self._run(cmd)
+
+    def test_sweep_tau_ex3(self):
+        cmd = "10 1000 10000 -t 10.0 -r 20.0 -ws 1.0 -a 250 -x 0.5 -N 10000"
+        self._run(cmd)
+
+
+def sample_recap_simplify(slim_ts, sample_size, Ne, r, mu):
+    """
+    takes a ts from slim and samples, recaps, simplifies
+    """
+    recap = msprime.sim_ancestry(
+        initial_state=slim_ts,
+        population_size=Ne,
+        recombination_rate=r,
+        start_time=slim_ts.metadata["SLiM"]["generation"],
+    )
+    rts = pyslim.SlimTreeSequence(recap)
+    logging.debug(f"pyslim: slim generation:{slim_ts.metadata['SLiM']['generation']}")
+    alive_inds = rts.individuals_alive_at(0)
+    keep_indivs = np.random.choice(alive_inds, sample_size, replace=False)
+    keep_nodes = []
+    for i in keep_indivs:
+        keep_nodes.extend(rts.individual(i).nodes)
+    logging.debug(f"before simplify {rts.num_nodes} nodes")
+    sts = rts.simplify(keep_nodes)
+    logging.debug(f"after simplify {sts.num_nodes} nodes")
+    logging.debug(f"after simplify {sts.num_trees} trees")
+    return pyslim.SlimTreeSequence(msprime.mutate(sts, rate=mu))
+
+
+class SweepVsSlim(Test):
+    """
+    Tests where we compare the msprime sweeps with SLiM simulations.
+    """
+
+    def run_sweep_slim_comparison(self, slim_args, **kwargs):
+        df = pd.DataFrame()
+
+        kwargs["model"] = "msp"
+        logging.debug(f"Running: {kwargs}")
+        seq_length = kwargs.get("seq_length")
+        pop_size = kwargs.get("pop_size")
+        s = kwargs.get("s")
+        tau = kwargs.get("tau")
+        sample_size = kwargs.get("sample_size")
+        recombination_rate = kwargs.get("recombination_rate")
+        num_replicates = kwargs.get("num_replicates")
+        sweep = msprime.SweepGenicSelection(
+            position=seq_length / 2,
+            start_frequency=1.0 / (2 * pop_size),
+            end_frequency=1.0 - (1.0 / (2 * pop_size)),
+            s=s,
+            dt=1e-6,
+        )
+        replicates = msprime.sim_ancestry(
+            sample_size,
+            population_size=pop_size,
+            model=[None, (tau, sweep), (None, "hudson")],
+            recombination_rate=recombination_rate,
+            sequence_length=seq_length,
+            num_replicates=num_replicates,
+        )
+        wins = range(0, int(seq_length + 1), int(seq_length / 20))
+        mids = np.zeros(len(wins) - 1)
+        for i in range(len(wins) - 1):
+            mids[i] = (wins[i + 1] + wins[i]) / 2
+        msp_win_pis = []
+        slim_win_pis = []
+        data = collections.defaultdict(list)
+        for ts in replicates:
+            t_mrca = np.zeros(ts.num_trees)
+            for tree in ts.trees():
+                t_mrca[tree.index] = tree.time(tree.root)
+            data["tmrca_mean"].append(np.mean(t_mrca))
+            data["num_trees"].append(ts.num_trees)
+            mutated_ts = msprime.sim_mutations(ts, rate=1e-8)
+            data["pi"].append(mutated_ts.diversity().reshape((1,))[0])
+            data["model"].append("msp")
+            msp_num_samples = ts.num_samples
+            msp_win_pis.append(mutated_ts.diversity(windows=wins))
+        slim_script = self.output_dir / "slim_script.txt"
+        outfile = self.output_dir / "slim.trees"
+        slim_args["OUTFILE"] = str(outfile)
+        write_sweep_slim_script(slim_script, slim_args)
+
+        cmd = _slim_executable + [slim_script]
+        for _ in range(kwargs["num_replicates"]):
+            subprocess.check_output(cmd)
+            ts = pyslim.load(outfile)
+            rts = sample_recap_simplify(
+                ts, sample_size, pop_size, recombination_rate, 1e-8
+            )
+            assert rts.num_samples == msp_num_samples
+
+            t_mrca = np.zeros(rts.num_trees)
+            for tree in rts.trees():
+                t_mrca[tree.index] = tree.time(tree.root)
+
+            data["tmrca_mean"].append(np.mean(t_mrca))
+            data["num_trees"].append(rts.num_trees)
+            slim_win_pis.append(rts.diversity(windows=wins))
+            data["pi"].append(rts.diversity().reshape((1,))[0])
+            data["model"].append("slim")
+        df = df.append(pd.DataFrame(data))
+
+        df_slim = df[df.model == "slim"]
+        df_msp = df[df.model == "msp"]
+        for stat in ["tmrca_mean", "num_trees", "pi"]:
+            v1 = df_slim[stat]
+            v2 = df_msp[stat]
+            sm.graphics.qqplot(v1)
+            sm.qqplot_2samples(v1, v2, line="45")
+            pyplot.xlabel("msp")
+            pyplot.ylabel("SLiM")
+            f = self.output_dir / f"{stat}.png"
+            pyplot.savefig(f, dpi=72)
+            pyplot.close("all")
+            plot_stat_hist(v1, v2, "slim", "msp")
+            f = self.output_dir / f"{stat}.hist.png"
+            pyplot.savefig(f, dpi=72)
+            pyplot.close("all")
+        pyplot.plot(mids, np.array(msp_win_pis).mean(axis=0), label="msp")
+        pyplot.plot(mids, np.array(slim_win_pis).mean(axis=0), label="slim")
+        pyplot.title(f"tau: {tau}")
+        pyplot.xlabel("location (bp)")
+        pyplot.ylabel("pairwise diversity")
+        pyplot.legend()
+        f = self.output_dir / "pi_wins.png"
+        pyplot.savefig(f, dpi=72)
+        pyplot.close("all")
+
+    def _run(
+        self,
+        sample_size,
+        seq_length,
+        pop_size,
+        recombination_rate,
+        s,
+        tau,
+        num_replicates=None,
+    ):
+        """
+        basic tests for sweeps vs slim
+        """
+        slim_args = {}
+
+        if num_replicates is None:
+            num_replicates = 20
+
+        # These are *diploid* samples in msprime
+        slim_args["sample_size"] = 2 * sample_size
+        slim_args["r"] = recombination_rate
+        slim_args["NUMLOCI"] = int(seq_length - 1)
+        slim_args["POPSIZE"] = int(pop_size)
+        slim_args["TAU"] = tau
+        slim_args["s"] = s
+        slim_args["SWEEPPOS"] = int(seq_length / 2)
+        self.run_sweep_slim_comparison(
+            slim_args,
+            pop_size=pop_size,
+            sample_size=sample_size,
+            num_replicates=num_replicates,
+            seq_length=seq_length,
+            tau=tau,
+            s=s,
+            recombination_rate=recombination_rate,
+        )
+
+    def test_sweep_vs_slim_ex1(self):
+        self._run(10, 1e6, 1e3, 1e-7, 0.25, 1, num_replicates=10)
+
+    def test_sweep_vs_slim_ex2(self):
+        self._run(10, 1e6, 1e3, 1e-7, 0.25, 200, num_replicates=10)
+
+    def test_sweep_vs_slim_ex3(self):
+        self._run(10, 1e6, 1e3, 1e-7, 0.25, 1000, num_replicates=10)
+
+    def test_sweep_vs_slim_ex4(self):
+        self._run(10, 1e6, 1e3, 1e-7, 0.25, 2000, num_replicates=10)
+
+    def test_sweep_vs_slim_ex5(self):
+        self._run(10, 1e6, 1e3, 1e-7, 0.25, 5000, num_replicates=10)
 
 
 # FIXME disabling these for now because they are unreliable and result in
@@ -1207,7 +1498,7 @@ class SweepAnalytical(Test):
         return 4.0 / s * inner
 
     def test_sojourn_time(self):
-        alphas = np.arange(100, 5000, 100)
+        alphas = np.arange(5e-3, 5e-2, 5e-3)
         refsize = 1e4
         nreps = 500
         seqlen = 1e4
@@ -1215,17 +1506,18 @@ class SweepAnalytical(Test):
         rho = 0
         p0 = 1.0 / (2 * refsize)
         p1 = 1 - p0
-        dt = 1.0 / (40 * refsize)
+        dt = 1.0 / (400 * refsize)
         pos = np.floor(seqlen / 2)
         df = pd.DataFrame()
         data = collections.defaultdict(list)
         for a in alphas:
             mod = msprime.SweepGenicSelection(
-                start_frequency=p0, end_frequency=p1, alpha=a, dt=dt, position=pos
+                start_frequency=p0, end_frequency=p1, s=a, dt=dt, position=pos
             )
+            s = a / 2 / refsize
             replicates = msprime.simulate(
-                nreps,
-                Ne=0.25,
+                10,
+                Ne=refsize,
                 model=[mod],
                 length=seqlen,
                 num_labels=2,
@@ -1245,7 +1537,58 @@ class SweepAnalytical(Test):
                 reptimes[i] = np.max(tree_times)
                 i += 1
             data["alpha_means"].append(np.mean(reptimes))
-            data["exp_means"].append(self.hermissonPennings_exp_sojourn(a) / 2)
+            data["exp_means"].append(self.charlesworth_exp_sojourn(a, s))
+        df = pd.DataFrame.from_dict(data)
+        df = df.fillna(0)
+        sm.qqplot_2samples(df["exp_means"], df["alpha_means"], line="45")
+        pyplot.xlabel("expected sojourn time")
+        pyplot.ylabel("simulated sojourn time")
+        f = self.output_dir / "sojourn.png"
+        pyplot.savefig(f, dpi=72)
+        pyplot.close("all")
+
+    def test_sojourn_time2(self):
+        alpha = 1000
+        refsizes = [0.25, 0.5, 1.0]
+        selrefsize = 1000
+        nreps = 500
+        seqlen = 1e4
+        mu = 2.5e-8
+        rho = 0
+        p0 = 1.0 / (2 * selrefsize)
+        p1 = 1 - p0
+        dt = 1.0 / (400 * selrefsize)
+        pos = np.floor(seqlen / 2)
+        df = pd.DataFrame()
+        data = collections.defaultdict(list)
+        for n in refsizes:
+            s = alpha / (2 * n)
+            mod = msprime.SweepGenicSelection(
+                start_frequency=p0, end_frequency=p1, s=s, dt=dt, position=pos
+            )
+            replicates = msprime.simulate(
+                10,
+                Ne=n,
+                model=[mod],
+                length=seqlen,
+                num_labels=2,
+                recombination_rate=rho,
+                mutation_rate=mu,
+                num_replicates=nreps,
+            )
+
+            reptimes = np.zeros(nreps)
+            i = 0
+            for x in replicates:
+                tree_times = np.zeros(x.num_trees)
+                j = 0
+                for tree in x.trees():
+                    tree_times[j] = np.max([tree.time(root) for root in tree.roots])
+                    j += 1
+                reptimes[i] = np.max(tree_times)
+                i += 1
+            data["alpha_means"].append(np.mean(reptimes))
+            data["exp_means"].append(self.hermissonPennings_exp_sojourn(alpha) * 2 * n)
         df = pd.DataFrame.from_dict(data)
         df = df.fillna(0)
         sm.qqplot_2samples(df["exp_means"], df["alpha_means"], line="45")
@@ -1482,9 +1825,7 @@ class DtwfVsCoalescentSimple(DtwfVsCoalescent):
 
     def test_dtwf_vs_coalescent_2_pops_massmigration(self):
         demography = msprime.Demography.isolated_model([1000, 1000])
-        demography.events.append(
-            msprime.MassMigration(time=300, source=1, destination=0, proportion=1.0)
-        )
+        demography.events.add_mass_migration(source=1, destination=0, proportion=1.0)
         self._run(
             samples={0: 10, 1: 10},
             demography=demography,
@@ -1614,7 +1955,7 @@ class DtwfVsCoalescentHighLevel(DtwfVsCoalescent):
                 row[i] = 0
                 migration_matrix.append(row)
 
-        demography.migration_matrix = migration_matrix
+        demography.migration_matrix[:] = migration_matrix
 
         super()._run(
             samples={j: sample_size for j, sample_size in enumerate(sample_sizes)},
@@ -1787,7 +2128,7 @@ class DtwfVsSlim(Test):
                 row = [default_mig_rate] * num_pops
                 row[i] = 0
                 migration_matrix.append(row)
-        demography.migration_matrix = migration_matrix
+        demography.migration_matrix[:] = migration_matrix
 
         # SLiM rates are 'immigration' forwards in time, which matches
         # DTWF backwards-time 'emmigration'
@@ -1854,7 +2195,7 @@ class DtwfVsCoalescentRandom(DtwfVsCoalescent):
             migration_matrix.append(
                 [random.uniform(0.05, 0.25) * (j != i) for j in range(N)]
             )
-        demography.migration_matrix = migration_matrix
+        demography.migration_matrix[:] = migration_matrix
 
         # Add demographic events and some migration rate changes
         t_max = 1000

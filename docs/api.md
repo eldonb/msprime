@@ -1,10 +1,10 @@
 # API Reference
 
 
-## Summary 
+## Summary
 
 ### Simulation functions
- 
+
 ```{eval-rst}
 .. currentmodule:: msprime
 
@@ -12,7 +12,7 @@
 
   sim_ancestry
   sim_mutations
-  
+
 ```
 
 ### Ancestry Models
@@ -47,17 +47,25 @@
   SLiMMutationModel
 ```
 
-### Demography
+### Defining demography
 
 ```{eval-rst}
 .. autosummary::
 
   Demography
-  DemographyDebugger
   Population
-  MassMigration 
+  DemographyDebugger
+```
+### Demographic events
+
+```{eval-rst}
+.. autosummary::
+
   PopulationParametersChange
   MigrationRateChange
+  SymmetricMigrationRateChange
+  PopulationSplit
+  MassMigration
 ```
 
 
@@ -233,18 +241,17 @@ The node was created by a :class:`msprime.CensusEvent`.
 
 ```{eval-rst}
 .. autoclass:: msprime.PopulationParametersChange
-```
 
-```{eval-rst}
+.. autoclass:: msprime.SymmetricMigrationRateChange
+
 .. autoclass:: msprime.MigrationRateChange
-```
 
-```{eval-rst}
+.. autoclass:: msprime.PopulationSplit
+
 .. autoclass:: msprime.MassMigration
-```
 
-```{eval-rst}
 .. autoclass:: msprime.CensusEvent
+
 ```
 
 ```{eval-rst}

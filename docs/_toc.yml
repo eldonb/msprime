@@ -11,23 +11,22 @@
       - file: ancestry
       - file: demography
       - file: mutations
-    - file: utilities
-      sections:
-      - file: likelihoods
-      - file: rate_maps
-      - file: cli
-      - file: logging
+    - file: cli
     - file: api
+    - file: logging
+    - file: likelihoods
+    - file: rate_maps
 
 - part: Miscellaneous
   chapters:
-  - file : notes_ms_users
+  - file: notes_ms_users
   - file: development
   - file: legacy
+  - file: CITATION
+  - file: CHANGELOG
 
   # Stuff we haven't converted to md yet.
-  - file: changelog
-  - file: CITATION
+  # - file: changelog
 
   # This is going to be deleted once we get the remaining content
   # ported somewhere else.

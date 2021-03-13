@@ -214,12 +214,12 @@ def _demography_factory(
 ):
     demography = demog.Demography.from_old_style(
         population_configurations,
-        migration_matrix,
-        demographic_events,
+        migration_matrix=migration_matrix,
+        demographic_events=demographic_events,
         Ne=Ne,
+        ignore_sample_size=True,
     )
-    demography.validate()
-    return demography
+    return demography.validate()
 
 
 def _build_initial_tables(*, sequence_length, samples, ploidy, demography, pedigree):
@@ -728,18 +728,6 @@ def _parse_rate_map(rate_param, sequence_length, name):
     return rate_map
 
 
-def _get_population(demography, key):
-    if isinstance(key, str):
-        pop_id = demography.name_to_id(key)
-    elif core.isinteger(key):
-        pop_id = int(key)
-        if pop_id < 0 or pop_id >= demography.num_populations:
-            raise ValueError(f"Population ID '{key}' out of bounds")
-    else:
-        raise TypeError("Population references either be integer IDs or string names")
-    return pop_id
-
-
 def _insert_sample_sets(sample_sets, demography, default_ploidy, tables):
     """
     Insert the samples described in the specified {population_id: num_samples}
@@ -747,12 +735,16 @@ def _insert_sample_sets(sample_sets, demography, default_ploidy, tables):
     """
     for sample_set in sample_sets:
         n = sample_set.num_samples
-        population = demography.populations[sample_set.population]
-        time = population.sampling_time if sample_set.time is None else sample_set.time
+        population = demography[sample_set.population]
+        time = (
+            population.default_sampling_time
+            if sample_set.time is None
+            else sample_set.time
+        )
         ploidy = default_ploidy if sample_set.ploidy is None else sample_set.ploidy
         logger.info(
             f"Sampling {n} individuals with ploidy {ploidy} in population "
-            f"{sample_set.population} (name='{population.name}') at time {time}"
+            f"{population.id} (name='{population.name}') at time {time}"
         )
         node_individual = len(tables.individuals) + np.repeat(
             np.arange(n, dtype=np.int32), ploidy
@@ -763,7 +755,7 @@ def _insert_sample_sets(sample_sets, demography, default_ploidy, tables):
         tables.nodes.append_columns(
             flags=np.full(N, tskit.NODE_IS_SAMPLE, dtype=np.uint32),
             time=np.full(N, time),
-            population=np.full(N, sample_set.population, dtype=np.int32),
+            population=np.full(N, population.id, dtype=np.int32),
             individual=node_individual,
         )
 
@@ -788,8 +780,6 @@ def _parse_sample_sets(sample_sets, demography):
                 raise ValueError(
                     "Must specify a SampleSet population in multipopulation models"
                 )
-        else:
-            sample_set.population = _get_population(demography, sample_set.population)
 
     if sum(sample_set.num_samples for sample_set in sample_sets) == 0:
         raise ValueError("Zero samples specified")
@@ -847,6 +837,7 @@ def _parse_sim_ancestry(
     record_full_arg=None,
     num_labels=None,
     random_seed=None,
+    init_for_debugger=False,
 ):
     """
     Argument parser for the sim_ancestry frontend. Interprets all the parameters
@@ -954,16 +945,17 @@ def _parse_sim_ancestry(
             raise ValueError("Cannot specify demography and population size")
     else:
         raise TypeError("demography argument must be an instance of msprime.Demography")
-    demography.validate()
+    demography = demography.validate()
 
     if initial_state is None:
-        if samples is None:
+        if samples is None and not init_for_debugger:
             raise ValueError(
                 "Either the samples or initial_state arguments must be provided"
             )
         initial_state = tskit.TableCollection(sequence_length)
         demography.insert_populations(initial_state)
-        _parse_samples(samples, demography, ploidy, initial_state)
+        if not init_for_debugger:
+            _parse_samples(samples, demography, ploidy, initial_state)
     else:
         if samples is not None:
             raise ValueError("Cannot specify both samples and initial_state")
@@ -1005,13 +997,13 @@ def _parse_sim_ancestry(
 def sim_ancestry(
     samples=None,
     *,
+    demography=None,
     sequence_length=None,
     discrete_genome=None,
     recombination_rate=None,
     gene_conversion_rate=None,
     gene_conversion_tract_length=None,
     population_size=None,
-    demography=None,
     ploidy=None,
     model=None,
     initial_state=None,
@@ -1041,6 +1033,15 @@ def sim_ancestry(
         is usually associated with :math:`k` sample *nodes* (or genomes) when
         ``ploidy`` = :math:`k`. See :ref:`sec_ancestry_samples` for further details.
         Either ``samples`` or ``initial_state`` must be specified.
+    :param demography: The demographic model to simulate, describing the
+        extant and ancestral populations, their population sizes and growth
+        rates, their migration rates, and demographic events affecting the
+        populations over time. See the :ref:`sec_demography` section for
+        details on how to specify demographic models and
+        :ref:`sec_ancestry_samples` for details on how to specify the
+        populations that samples are drawn from. If not specified (or None) we
+        default to a single population with constant size 1
+        (see also the ``population_size`` parameter).
     :param int ploidy: The number of monoploid genomes per sample individual
         (Default=2). See :ref:`sec_ancestry_ploidy` for usage examples.
     :param float sequence_length: The length of the genome sequence to simulate.
@@ -1325,6 +1326,13 @@ class Simulator(_msprime.Simulator):
                     f"current time = {current_time}; start_time = {model_start_time}"
                 )
             self._run_until(model_start_time, event_chunk, debug_func)
+            logger.info(
+                "model %s ended at time=%g nodes=%d edges=%d",
+                self.model,
+                self.time,
+                self.num_nodes,
+                self.num_edges,
+            )
             if self.time > model_start_time:
                 raise NotImplementedError(
                     "The previously running model does not support ending early "
@@ -1393,7 +1401,7 @@ class SampleSet:
     """
 
     num_samples: int
-    population: Union[int, None] = None
+    population: Union[int, str, None] = None
     time: Union[float, None] = None
     ploidy: Union[int, None] = None
 
@@ -1698,7 +1706,51 @@ class DiracCoalescent(ParametricAncestryModel):
 @dataclasses.dataclass
 class SweepGenicSelection(ParametricAncestryModel):
     """
-    .. todo:: Document me
+    A selective sweep that has occured in the history of the sample.
+    This will lead to a burst of rapid coalescence near the selected site.
+
+    The strength of selection during the sweep is determined by the
+    parameter :math:`s`. Here we define s such that the
+    fitness of the three genotypes at our benefical locus are
+    :math:`W_{bb}=1`, :math:`W_{Bb}=1 + s/2`, :math:`W_{BB}=1 + s`.
+    Thus fitness of the heterozygote is intermediate to the
+    two homozygotes.
+
+    The model is one of a
+    a structured coalescent where selective backgrounds are defined as in
+    `Braverman et al. (1995) <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1206652/>`_
+    The implementation details here follow closely to those in discoal,
+    `Kern and Schrider (2016)
+    <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5167068/>`_
+
+    See :ref:`sec_ancestry_models_selective_sweeps` for a basic usage and example and
+    :ref:`sec_ancestry_models_sweep_types` for details on how to specify different
+    types of sweeps.
+
+    .. warning::
+        If the effective strength of selection (:math:`2Ns`) is sufficiently large
+        the time difference between successive events can be smaller than
+        the finite precision available, leading to zero length branches
+        in the output trees. As this is not allowed by tskit, an error
+        will be raised.
+
+    .. warning::
+        Currently models with more than one population and a selective sweep
+        are not implemented. Further population size change during the sweep
+        is not yet possible in msprime.
+
+    :param float position: the location of the beneficial allele along the
+        chromosome.
+    :param float start_frequency: population frequency of the benefical
+        allele at the start of the selective sweep. E.g., for a *de novo*
+        allele in a diploid population of size N, start frequency would be
+        :math:`1/2N`.
+    :param float end_frequency: population frequency of the beneficial
+        allele at the end of the selective sweep.
+    :param float s: :math:`s` is the selection coefficient of the beneficial mutation.
+    :param float dt: dt is the small increment of time for stepping through
+        the sweep phase of the model. a good rule of thumb is for this to be
+        approximately :math:`1/40N` or smaller.
     """
 
     name = "sweep_genic_selection"
@@ -1706,5 +1758,5 @@ class SweepGenicSelection(ParametricAncestryModel):
     position: Union[float, None] = None
     start_frequency: Union[float, None] = None
     end_frequency: Union[float, None] = None
-    alpha: Union[float, None] = None
+    s: Union[float, None] = None
     dt: Union[float, None] = None

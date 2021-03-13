@@ -22,9 +22,6 @@ Test that the documentation examples do what they are supposed to.
 import contextlib
 import io
 import sys
-from unittest import mock
-
-import stdpopsim
 
 from docs import examples
 
@@ -41,28 +38,6 @@ def capture_stdout():
 
 
 class TestDocumentationExamples:
-    def test_ooa_model(self):
-        correct_model = stdpopsim.get_species("HomSap").get_demographic_model(
-            "OutOfAfrica_3G09"
-        )
-        ooa_docs = examples.out_of_africa()
-        pops = []
-        for pop_config in ooa_docs["population_configurations"]:
-            pops.append(stdpopsim.Population(id=None, description=None))
-            pop_config.sample_size = None
-
-        local_model = stdpopsim.DemographicModel(
-            id=None,
-            description=None,
-            long_description=None,
-            generation_time=None,
-            populations=pops,
-            population_configurations=ooa_docs["population_configurations"],
-            migration_matrix=ooa_docs["migration_matrix"],
-            demographic_events=ooa_docs["demographic_events"],
-        )
-        correct_model.verify_equal(local_model)
-
     def test_segregating_sites(self):
         with capture_stdout() as stdout:
             examples.segregating_sites(10, 5, 10)
@@ -78,11 +53,3 @@ class TestDocumentationExamples:
         assert len(output) == 2
         assert output[0].startswith("Observed")
         assert output[1].startswith("Predicted")
-
-    def test_logging_info(self):
-        with mock.patch("daiquiri.setup"):
-            examples.logging_info_example()
-
-    def test_logging_debug(self):
-        with mock.patch("daiquiri.setup"):
-            examples.logging_debug_example()

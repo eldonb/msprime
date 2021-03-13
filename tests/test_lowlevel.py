@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2015-2020 University of Oxford
+# Copyright (C) 2015-2021 University of Oxford
 #
 # This file is part of msprime.
 #
@@ -26,6 +26,7 @@ import io
 import itertools
 import math
 import pathlib
+import pickle
 import platform
 import random
 import tempfile
@@ -86,7 +87,7 @@ def get_sweep_genic_selection_model(
     position=0.5,
     start_frequency=0.1,
     end_frequency=0.9,
-    alpha=0.1,
+    s=0.1,
     dt=0.1,
 ):
     """
@@ -97,17 +98,23 @@ def get_sweep_genic_selection_model(
         position=position,
         start_frequency=start_frequency,
         end_frequency=end_frequency,
-        alpha=alpha,
+        s=s,
         dt=dt,
     )
 
 
-def get_population_configuration(growth_rate=0.0, initial_size=1.0):
+def get_population_configuration(
+    growth_rate=0.0, initial_size=1.0, initially_active=True
+):
     """
     Returns a population configuration dictionary suitable for passing
     to the low-level API.
     """
-    return {"growth_rate": growth_rate, "initial_size": initial_size}
+    return {
+        "growth_rate": growth_rate,
+        "initial_size": initial_size,
+        "initially_active": initially_active,
+    }
 
 
 def get_samples(num_samples):
@@ -180,6 +187,19 @@ def get_migration_rate_change_event(time=0.0, migration_rate=1.0, source=-1, des
     }
 
 
+def get_symmetric_migration_rate_change_event(time=0.0, populations=None, rate=1.0):
+    """
+    Returns a symmetric_migration_rate change demographic event.
+    """
+    populations = [0, 1] if populations is None else populations
+    return {
+        "type": "symmetric_migration_rate_change",
+        "rate": rate,
+        "time": time,
+        "populations": populations,
+    }
+
+
 def get_mass_migration_event(time=0.0, source=0, dest=1, proportion=1):
     """
     Returns a mass_migration demographic event.
@@ -190,6 +210,34 @@ def get_mass_migration_event(time=0.0, source=0, dest=1, proportion=1):
         "source": source,
         "dest": dest,
         "proportion": proportion,
+    }
+
+
+def get_population_split_event(time=0.0, derived=None, ancestral=1):
+    """
+    Returns a population split demographic event.
+    """
+    derived = [0] if derived is None else derived
+    return {
+        "type": "population_split",
+        "time": time,
+        "derived": derived,
+        "ancestral": ancestral,
+    }
+
+
+def get_admixture_event(time=0.0, derived=1, ancestral=None, proportions=None):
+    """
+    Returns a population split demographic event.
+    """
+    ancestral = [0] if ancestral is None else ancestral
+    proportions = [1] if proportions is None else proportions
+    return {
+        "type": "admixture",
+        "time": time,
+        "derived": derived,
+        "ancestral": ancestral,
+        "proportions": proportions,
     }
 
 
@@ -613,6 +661,10 @@ class TestSimulationState(LowLevelTestCase):
             avl_node_block_size=avl_node_block_size,
             node_mapping_block_size=node_mapping_block_size,
         )
+        # Add state to the population configurations
+        for conf in population_configuration:
+            conf["state"] = 1
+            del conf["initially_active"]
         for _ in range(3):
             # Check initial state
             assert 0 == sim.num_breakpoints
@@ -823,6 +875,10 @@ class TestSimulationState(LowLevelTestCase):
             population_configuration=population_configuration,
             demographic_events=demographic_events,
         )
+        # Add "state" to all the configs
+        for conf in population_configuration:
+            del conf["initially_active"]
+            conf["state"] = 1
         assert np.array_equal(sim.migration_matrix, migration_matrix)
         assert sim.population_configuration == population_configuration
 
@@ -1258,7 +1314,7 @@ class TestSimulator(LowLevelTestCase):
             position=0.5,
             start_frequency=0.1,
             end_frequency=0.5,
-            alpha=0.1,
+            s=0.1,
         )
         with pytest.raises(ValueError):
             f(model=model)
@@ -1282,7 +1338,7 @@ class TestSimulator(LowLevelTestCase):
             model = get_sweep_genic_selection_model(end_frequency=bad_type)
             with pytest.raises(TypeError):
                 f(model=model)
-            model = get_sweep_genic_selection_model(alpha=bad_type)
+            model = get_sweep_genic_selection_model(s=bad_type)
             with pytest.raises(TypeError):
                 f(model=model)
             model = get_sweep_genic_selection_model(dt=bad_type)
@@ -1441,9 +1497,10 @@ class TestSimulator(LowLevelTestCase):
             conf_dicts = s.population_configuration
             assert len(conf_dicts) == len(conf_tuples)
             for conf_dict, conf_tuple in zip(conf_dicts, conf_tuples):
-                assert len(conf_dict) == 2
+                assert len(conf_dict) == 3
                 assert conf_dict["initial_size"] == conf_tuple[0]
                 assert conf_dict["growth_rate"] == conf_tuple[1]
+                assert conf_dict["state"] == 1
 
         f(2, [(1, 1)])
         f(2, [(2, 0), (0.5, 0.1)])
@@ -1527,7 +1584,10 @@ class TestSimulator(LowLevelTestCase):
             get_size_change_event,
             get_growth_rate_change_event,
             get_migration_rate_change_event,
+            get_symmetric_migration_rate_change_event,
             get_mass_migration_event,
+            get_population_split_event,
+            get_admixture_event,
             get_simple_bottleneck_event,
             get_instantaneous_bottleneck_event,
         ]
@@ -1585,6 +1645,38 @@ class TestSimulator(LowLevelTestCase):
             with pytest.raises(TypeError):
                 f([event])
 
+            # We test the bad types for derived elsewhere as it's more complicated.
+            event = get_population_split_event(derived=[0], ancestral=bad_type)
+            with pytest.raises(TypeError):
+                f([event])
+            event = get_population_split_event()
+            del event["derived"]
+            with pytest.raises(ValueError):
+                f([event])
+
+            # We test the bad types for ancestral and proportion elsewhere as
+            # it's more complicated.
+            event = get_admixture_event(ancestral=[0], derived=bad_type)
+            with pytest.raises(TypeError):
+                f([event])
+            event = get_admixture_event()
+            del event["ancestral"]
+            with pytest.raises(ValueError):
+                f([event])
+            event = get_admixture_event()
+            del event["proportions"]
+            with pytest.raises(ValueError):
+                f([event])
+
+            # We test bad types for populations elsewhere also
+            event = get_symmetric_migration_rate_change_event(rate=bad_type)
+            del event["populations"]
+            with pytest.raises(ValueError):
+                f([event])
+            event = get_symmetric_migration_rate_change_event(rate=bad_type)
+            with pytest.raises(TypeError):
+                f([event])
+
             event = get_migration_rate_change_event(source=bad_type)
             with pytest.raises(TypeError):
                 f([event])
@@ -1620,7 +1712,10 @@ class TestSimulator(LowLevelTestCase):
             get_size_change_event,
             get_growth_rate_change_event,
             get_migration_rate_change_event,
+            get_symmetric_migration_rate_change_event,
             get_mass_migration_event,
+            get_population_split_event,
+            get_admixture_event,
             get_simple_bottleneck_event,
             get_instantaneous_bottleneck_event,
         ]
@@ -1651,6 +1746,23 @@ class TestSimulator(LowLevelTestCase):
             with pytest.raises(_msprime.InputError):
                 f([event])
             event = get_simple_bottleneck_event(population=bad_pop_id)
+            with pytest.raises(_msprime.InputError):
+                f([event])
+            event = get_population_split_event(derived=[bad_pop_id])
+            with pytest.raises(_msprime.InputError):
+                f([event])
+            event = get_population_split_event(ancestral=bad_pop_id)
+            with pytest.raises(_msprime.InputError):
+                f([event])
+            event = get_admixture_event(derived=bad_pop_id)
+            with pytest.raises(_msprime.InputError):
+                f([event])
+            event = get_admixture_event(ancestral=[bad_pop_id])
+            with pytest.raises(_msprime.InputError):
+                f([event])
+            event = get_symmetric_migration_rate_change_event(
+                populations=[0, bad_pop_id]
+            )
             with pytest.raises(_msprime.InputError):
                 f([event])
         # Negative size values not allowed
@@ -1713,7 +1825,10 @@ class TestSimulator(LowLevelTestCase):
             get_size_change_event,
             get_growth_rate_change_event,
             get_migration_rate_change_event,
+            get_symmetric_migration_rate_change_event,
             get_mass_migration_event,
+            get_population_split_event,
+            get_admixture_event,
             get_simple_bottleneck_event,
         ]
         events = []
@@ -1889,6 +2004,195 @@ class TestSimulator(LowLevelTestCase):
             for _, _, _, pop_id in ind:
                 pop_sizes_after[pop_id] += 1
         assert pop_sizes_before[0] == pop_sizes_after[1]
+
+    def test_population_split_errors(self):
+        def f(derived):
+            return make_sim(
+                samples=10,
+                num_populations=3,
+                population_configuration=[
+                    get_population_configuration(),
+                    get_population_configuration(),
+                    get_population_configuration(),
+                ],
+                demographic_events=[
+                    get_population_split_event(0, derived=derived, ancestral=1)
+                ],
+                migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            )
+
+        for bad_array in [{}, [[], []], ["sdf"]]:
+            with pytest.raises(ValueError):
+                f(bad_array)
+
+        with pytest.raises(ValueError, match="at least one derived"):
+            f([])
+        for too_large in [100, 101, 10 ** 6]:
+            with pytest.raises(_msprime.InputError, match="more than 100"):
+                f(range(too_large))
+            with pytest.raises(_msprime.InputError, match="more than 100"):
+                f(np.arange(too_large, dtype=np.int32))
+        with pytest.raises(_msprime.InputError, match="IDs must be unique"):
+            f([0, 0])
+
+    def test_admixture_errors(self):
+        def f(ancestral, proportions):
+            return make_sim(
+                samples=10,
+                num_populations=3,
+                population_configuration=[
+                    get_population_configuration(),
+                    get_population_configuration(),
+                    get_population_configuration(),
+                ],
+                demographic_events=[
+                    get_admixture_event(
+                        0, derived=2, ancestral=ancestral, proportions=proportions
+                    )
+                ],
+                migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            )
+
+        for bad_array in [{}, [[], []], ["sdf"]]:
+            with pytest.raises(ValueError):
+                f(bad_array, [1.0])
+            with pytest.raises(ValueError):
+                f([1], bad_array)
+
+        with pytest.raises(ValueError, match="at least one ancestral"):
+            f([], [])
+        for too_large in [100, 101, 10 ** 6]:
+            with pytest.raises(_msprime.InputError, match="more than 100"):
+                f(range(too_large), range(too_large))
+            with pytest.raises(_msprime.InputError, match="more than 100"):
+                f(np.arange(too_large, dtype=np.int32), range(too_large))
+        with pytest.raises(_msprime.InputError, match="IDs must be unique"):
+            f([0, 0], [0, 1])
+        with pytest.raises(ValueError, match="must be same size"):
+            f([0], [0, 1])
+
+    def test_population_split(self):
+        n = 10
+        t = 0.01
+        dt = 0.0000001
+        sim = make_sim(
+            samples=n,
+            num_populations=3,
+            population_configuration=[
+                get_population_configuration(),
+                get_population_configuration(),
+                get_population_configuration(),
+            ],
+            demographic_events=[
+                get_population_split_event(t + dt, derived=[0, 1], ancestral=2),
+            ],
+            migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        )
+        sim.run(t)
+        pop_sizes_before = [0, 0, 0]
+        for ind in sim.ancestors:
+            for _, _, _, pop_id in ind:
+                pop_sizes_before[pop_id] += 1
+        assert pop_sizes_before[2] == 0
+        sim.run(t + 2 * dt)
+        pop_sizes_after = [0, 0, 0]
+        for ind in sim.ancestors:
+            for _, _, _, pop_id in ind:
+                pop_sizes_after[pop_id] += 1
+        assert pop_sizes_after[2] == sum(pop_sizes_before[:2])
+
+    def test_admixture(self):
+        n = 10
+        t = 0.01
+        dt = 0.0000001
+        sim = make_sim(
+            samples=n,
+            num_populations=3,
+            population_configuration=[
+                get_population_configuration(),
+                get_population_configuration(),
+                get_population_configuration(),
+            ],
+            demographic_events=[
+                get_admixture_event(
+                    t + dt, derived=0, ancestral=[1, 2], proportions=[1, 0]
+                ),
+            ],
+            migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        )
+        sim.run(t)
+        pop_sizes_before = [0, 0, 0]
+        for ind in sim.ancestors:
+            for _, _, _, pop_id in ind:
+                pop_sizes_before[pop_id] += 1
+        assert pop_sizes_before[0] > 0
+        assert pop_sizes_before[1] == 0
+        assert pop_sizes_before[2] == 0
+        sim.run(t + 2 * dt)
+        pop_sizes_after = [0, 0, 0]
+        for ind in sim.ancestors:
+            for _, _, _, pop_id in ind:
+                pop_sizes_after[pop_id] += 1
+        assert pop_sizes_after[0] == 0
+        assert pop_sizes_after[2] == 0
+        assert pop_sizes_after[1] == pop_sizes_before[0]
+
+    def test_symmetric_migration_rate_change_errors(self):
+        def f(populations):
+            return make_sim(
+                samples=10,
+                num_populations=3,
+                population_configuration=[
+                    get_population_configuration(),
+                    get_population_configuration(),
+                    get_population_configuration(),
+                ],
+                demographic_events=[
+                    get_symmetric_migration_rate_change_event(
+                        0, populations=populations, rate=1
+                    )
+                ],
+                migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            )
+
+        for bad_array in [{}, [[], []], ["sdf"]]:
+            with pytest.raises(ValueError):
+                f(bad_array)
+        for repeated in [[0, 0], [0, 1, 2, 0]]:
+            with pytest.raises(_msprime.InputError, match="Cannot set diagonal"):
+                f(repeated)
+        for bad_pop in [5, -1, 2 ** 30]:
+            with pytest.raises(_msprime.InputError, match="Bad migration matrix index"):
+                f([0, bad_pop])
+        for too_short in [[], [1]]:
+            with pytest.raises(ValueError, match="at least two"):
+                f(too_short)
+
+    def test_symmetric_migration_rate_change(self):
+        n = 10
+        t = 0.01
+        sim = make_sim(
+            samples=n,
+            num_populations=3,
+            population_configuration=[
+                get_population_configuration(),
+                get_population_configuration(),
+                get_population_configuration(),
+            ],
+            demographic_events=[
+                get_symmetric_migration_rate_change_event(
+                    t, populations=[0, 1], rate=1
+                ),
+            ],
+            migration_matrix=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        )
+        sim.run(t)
+        M = np.zeros((3, 3))
+        assert np.array_equal(sim.migration_matrix, M)
+        sim.run(t + 1e-6)
+        M[0, 1] = 1
+        M[1, 0] = 1
+        assert np.array_equal(sim.migration_matrix, M)
 
     def test_bottleneck(self):
         n = 10
@@ -2688,3 +2992,13 @@ class TestLikelihood:
         lw_tables = _msprime.LightweightTableCollection(0)
         with pytest.raises(_msprime.LibraryError):
             _msprime.log_likelihood_arg(lw_tables, 1, 1)
+
+
+def test_pickle_exceptions():
+    exception = _msprime.LibraryError("xyz")
+    s = pickle.dumps(exception)
+    assert str(pickle.loads(s)) == str(exception)
+
+    exception = _msprime.InputError("xyz")
+    s = pickle.dumps(exception)
+    assert str(pickle.loads(s)) == str(exception)

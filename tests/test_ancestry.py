@@ -653,7 +653,7 @@ class TestParseSimAncestry:
         demography = msprime.Demography.stepping_stone_model([1] * 5, 0.1)
         samples = {0: 2}
         sim = ancestry._parse_sim_ancestry(samples, demography=demography)
-        assert sim.demography is demography
+        assert sim.demography is not demography
         assert sim.num_populations == demography.num_populations
         assert np.array_equal(sim.migration_matrix, demography.migration_matrix)
         # Numeric samples fail here as we have more than 1 population
@@ -759,7 +759,7 @@ class TestSimAncestrySamples:
 
     def test_sample_sets_override_time(self):
         demography = msprime.Demography.isolated_model([1])
-        demography.populations[0].sampling_time = 10
+        demography.populations[0].default_sampling_time = 10
         samples = [
             msprime.SampleSet(1, ploidy=2, time=2),
             msprime.SampleSet(1, ploidy=3),  # No time, should use default
@@ -854,6 +854,7 @@ class TestSimAncestrySamples:
         assert np.all(tables.nodes.population[:4] == 0)
 
     def verify_samples_map(self, samples, demography, ploidy):
+        demography = demography.validate()
         sim = ancestry._parse_sim_ancestry(
             samples=samples, demography=demography, ploidy=ploidy
         )
@@ -871,7 +872,10 @@ class TestSimAncestrySamples:
                 for _ in range(ploidy):
                     node = tables.nodes[node_id]
                     assert node.individual == ind_id
-                    assert node.time == demography.populations[pop_id].sampling_time
+                    assert (
+                        node.time
+                        == demography.populations[pop_id].default_sampling_time
+                    )
                     assert node.population == pop_id
                     assert node.flags == tskit.NODE_IS_SAMPLE
                     node_id += 1
@@ -895,8 +899,8 @@ class TestSimAncestrySamples:
 
     def test_sample_time_with_map(self):
         demography = msprime.Demography.stepping_stone_model([1, 1], 0)
-        demography.populations[0].sampling_time = 1
-        demography.populations[1].sampling_time = 2
+        demography.populations[0].default_sampling_time = 1
+        demography.populations[1].default_sampling_time = 2
         samples = {0: 5, 1: 5}
         self.verify_samples_map(samples, demography, ploidy=1)
         self.verify_samples_map(samples, demography, ploidy=2)
@@ -905,7 +909,7 @@ class TestSimAncestrySamples:
         demography = msprime.Demography.stepping_stone_model([1, 1], 0)
         for bad_pop in [-1, 2]:
             samples = [msprime.SampleSet(2, time=0, population=bad_pop)]
-            with pytest.raises(ValueError):
+            with pytest.raises(KeyError):
                 ancestry._parse_sim_ancestry(samples=samples, demography=demography)
         for bad_pop in [1.1, ValueError]:
             samples = [msprime.SampleSet(2, time=0, population=bad_pop)]
@@ -1058,7 +1062,7 @@ class TestParseSimulate:
                     f(bad_type)
             # Now check for the structure of the matrix.
             matrix[0][0] = "bad value"
-            with pytest.raises(ValueError):
+            with pytest.raises(TypeError):
                 f(matrix)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1217,7 +1221,7 @@ class TestParseSimulate:
     def test_new_old_style_model_changes_equal(self):
         models = [
             msprime.SweepGenicSelection(
-                position=j, start_frequency=j, end_frequency=j, alpha=j, dt=j
+                position=j, start_frequency=j, end_frequency=j, s=j, dt=j
             )
             for j in range(1, 10)
         ]
@@ -1552,7 +1556,7 @@ class TestSimAncestryInterface:
             position=0.5,
             start_frequency=1.0 / (2 * N),
             end_frequency=1.0 - (1.0 / (2 * N)),
-            alpha=1000,
+            s=1000,
             dt=1e-6,
         )
         ts = msprime.sim_ancestry(10, model=model)
@@ -1834,6 +1838,12 @@ class TestReprRoundTrip:
         ]
         self.assert_repr_round_trip(examples)
 
+    def test_population_split(self):
+        examples = [
+            msprime.PopulationSplit(time=1, derived=[1, 2], ancestral=3),
+        ]
+        self.assert_repr_round_trip(examples)
+
     def test_simulation_model_change(self):
         examples = [
             msprime.SimulationModelChange(),
@@ -1877,7 +1887,7 @@ class TestReprRoundTrip:
             msprime.DiracCoalescent(),
             msprime.DiracCoalescent(psi=1234, c=56),
             msprime.SweepGenicSelection(
-                position=1, start_frequency=0.5, end_frequency=0.9, alpha=1, dt=1e-4
+                position=1, start_frequency=0.5, end_frequency=0.9, s=0.1, dt=1e-4
             ),
         ]
         self.assert_repr_round_trip(examples)
